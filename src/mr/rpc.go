@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -22,7 +24,31 @@ type ExampleReply struct {
 	Y int
 }
 
+// taskno: the coordinator has no task to dispatch
+// taskfinish: all work is done and the coordinator tells the workers to exit
+type TaskType int
+const (
+	TaskNo TaskType=iota
+	TaskMap
+	TaskReduce
+	TaskFinish
+)
+
+
 // Add your RPC definitions here.
+type AskForTaskArgs struct {
+	FinishedTaskType TaskType
+	FinishTaskList []int
+	FinishedTaskFile []string
+}
+
+// dispatchedtasklist: the list of the map/reduce task index, which is corresponding to a file in the coordinator
+type AskForTaskReply struct {
+	DispatchedTaskType TaskType
+	DispatchedTaskList []int
+	DispatchedTaskFile []string
+	ReduceNum int
+}
 
 
 // Cook up a unique-ish UNIX-domain socket name
