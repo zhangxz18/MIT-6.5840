@@ -52,18 +52,23 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) error{
 	reply.DispatchedTaskList = []int{}
 	reply.DispatchedTaskFile = []string{}
-	if c.now_state == StateInit{
+	reply.ReduceNum = c.reduce_num
+	// to avoid read and write at the same time, we use a copy of now_state
+	// the read of now_state is atomic, and we only need to achieve eventual consistency
+	// todo: use a mutex or channel here?
+	temp_nowstate := c.now_state
+	if temp_nowstate == StateInit{
 		reply.DispatchedTaskType = TaskNo
 		return nil
-	}else if c.now_state == StateMap{
-		c.ProcessFinishedTask(args)
-		c.DispatchTask(reply)
+	}else if temp_nowstate == StateMap{
+		c.ProcessFinishedTask(args, temp_nowstate)
+		c.DispatchTask(reply, temp_nowstate)
 		return nil
-	}else if c.now_state == StateReduce{
-		c.ProcessFinishedTask(args)
-		c.DispatchTask(reply)
+	}else if temp_nowstate == StateReduce{
+		c.ProcessFinishedTask(args, temp_nowstate)
+		c.DispatchTask(reply, temp_nowstate)
 		return nil
-	}else if c.now_state == StateDone{
+	}else if temp_nowstate == StateDone{
 		reply.DispatchedTaskType = TaskFinish
 		return nil
 	}else {
@@ -72,13 +77,13 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	}
 }
 
-func (c *Coordinator) ProcessFinishedTask(args *AskForTaskArgs){
-	if c.now_state == StateMap && args.FinishedTaskType == TaskMap{
+func (c *Coordinator) ProcessFinishedTask(args *AskForTaskArgs, temp_nowstate State){
+	if temp_nowstate == StateMap && args.FinishedTaskType == TaskMap{
 		for _, task_idx := range args.FinishTaskList{
 			task := WorkingTask{working_task_type: TaskMap, index: task_idx, filename: c.map_files[task_idx], start_working_time: time.Time{}}
 			c.done_chan <- task
 		}
-	}else if c.now_state == StateReduce && args.FinishedTaskType == TaskReduce{
+	}else if temp_nowstate == StateReduce && args.FinishedTaskType == TaskReduce{
 		for _, task_idx := range args.FinishTaskList{
 			task := WorkingTask{working_task_type: TaskReduce, index: task_idx, filename: "", start_working_time: time.Time{}}
 			c.done_chan <- task
@@ -87,7 +92,7 @@ func (c *Coordinator) ProcessFinishedTask(args *AskForTaskArgs){
 }
 
 
-func (c *Coordinator) DispatchTask(reply *AskForTaskReply){
+func (c *Coordinator) DispatchTask(reply *AskForTaskReply, temp_nowstate State){
 		var task WorkingTask
 		select{
 			case task = <- c.idle_chan:
@@ -95,9 +100,9 @@ func (c *Coordinator) DispatchTask(reply *AskForTaskReply){
 				reply.DispatchedTaskFile = append(reply.DispatchedTaskFile, task.filename)
 				reply.ReduceNum = c.reduce_num
 				task.start_working_time = time.Now()
-				if c.now_state == StateMap{
+				if temp_nowstate == StateMap{
 					reply.DispatchedTaskType = TaskMap
-				} else if c.now_state == StateReduce{
+				} else if temp_nowstate == StateReduce{
 					reply.DispatchedTaskType = TaskReduce
 				}
 				c.working_chan <- task
