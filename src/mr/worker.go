@@ -49,6 +49,8 @@ func Worker(mapf func(string, string) []KeyValue,
 	ask_for_task_reply := AskForTaskReply{}
 	// Your worker implementation here.
 	for {
+		// should initialize the finish_task_args here, otherwise if the server returns a zero value, the worker will use the last non-zero value
+		ask_for_task_reply = AskForTaskReply{}
 		call_result := CallAskForTask(&finish_task_args, &ask_for_task_reply)
 		if (!call_result) {
 			break
@@ -57,7 +59,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		finish_task_args.FinishTaskList = []int{}
 		finish_task_args.FinishedTaskFile = []string{}
 		if ask_for_task_reply.DispatchedTaskType == TaskNo{
-			time.Sleep(1000000) // sleep 1ms	
+			time.Sleep(1000000000) // sleep 1s	
 		} else if ask_for_task_reply.DispatchedTaskType == TaskMap{
 			DoMapTask(mapf, &finish_task_args, &ask_for_task_reply)
 		} else if ask_for_task_reply.DispatchedTaskType == TaskReduce{
@@ -202,7 +204,6 @@ func CallExample() {
 func CallAskForTask(task_args *AskForTaskArgs, task_reply *AskForTaskReply) bool{
 	ok := call("Coordinator.AskForTask", task_args, task_reply)
 	if ok {
-		// fmt.Printf("reply.tasktype %v\n", task_reply.DispatchedTaskType)
 		return true
 	} else {
 		fmt.Printf("call failed!\n")

@@ -28,7 +28,8 @@ type ExampleReply struct {
 // taskfinish: all work is done and the coordinator tells the workers to exit
 type TaskType int
 const (
-	TaskNo TaskType=iota
+	// the zero value will be omitted in the rpc encoding, it's a better solution to add another value like TaskNohting for zero
+	TaskNo TaskType=iota 
 	TaskMap
 	TaskReduce
 	TaskFinish
