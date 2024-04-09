@@ -187,6 +187,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		map_files:   files,
 		working_queue: []WorkingTask{},
 		done_queue: []WorkingTask{},
+		idle_chan: make(chan WorkingTask, len(files)),
+		working_chan: make(chan WorkingTask, len(files)),
+		done_chan: make(chan WorkingTask, len(files) * 2),
 	}
 
 	// Your code here.
@@ -195,9 +198,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.server()
 
 	// each file correspond to one map task
-	c.idle_chan = make(chan WorkingTask, len(files))
-	c.working_chan = make(chan WorkingTask, len(files))
-	c.done_chan = make(chan WorkingTask, len(files) * 2) // avoid a task is completed more than once
+	// c.idle_chan = make(chan WorkingTask, len(files))
+	// c.working_chan = make(chan WorkingTask, len(files))
+	// c.done_chan = make(chan WorkingTask, len(files) * 2) // avoid a task is completed more than once
 	for idx, filename := range files{
 		c.idle_chan <- WorkingTask{working_task_type: TaskMap, index: idx, filename: filename, start_working_time: time.Time{}}
 	}
