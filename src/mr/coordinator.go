@@ -60,11 +60,7 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 	if temp_nowstate == StateInit{
 		reply.DispatchedTaskType = TaskNo
 		return nil
-	}else if temp_nowstate == StateMap{
-		c.ProcessFinishedTask(args, temp_nowstate)
-		c.DispatchTask(reply, temp_nowstate)
-		return nil
-	}else if temp_nowstate == StateReduce{
+	}else if temp_nowstate == StateMap || temp_nowstate == StateReduce{
 		c.ProcessFinishedTask(args, temp_nowstate)
 		c.DispatchTask(reply, temp_nowstate)
 		return nil
@@ -78,12 +74,12 @@ func (c *Coordinator) AskForTask(args *AskForTaskArgs, reply *AskForTaskReply) e
 }
 
 func (c *Coordinator) ProcessFinishedTask(args *AskForTaskArgs, temp_nowstate State){
-	if temp_nowstate == StateMap && args.FinishedTaskType == TaskMap{
+	if args.FinishedTaskType == TaskMap{
 		for _, task_idx := range args.FinishTaskList{
 			task := WorkingTask{working_task_type: TaskMap, index: task_idx, filename: c.map_files[task_idx], start_working_time: time.Time{}}
 			c.done_chan <- task
 		}
-	}else if temp_nowstate == StateReduce && args.FinishedTaskType == TaskReduce{
+	}else if args.FinishedTaskType == TaskReduce{
 		for _, task_idx := range args.FinishTaskList{
 			task := WorkingTask{working_task_type: TaskReduce, index: task_idx, filename: "", start_working_time: time.Time{}}
 			c.done_chan <- task
@@ -100,10 +96,12 @@ func (c *Coordinator) DispatchTask(reply *AskForTaskReply, temp_nowstate State){
 				reply.DispatchedTaskFile = append(reply.DispatchedTaskFile, task.filename)
 				reply.ReduceNum = c.reduce_num
 				task.start_working_time = time.Now()
-				if temp_nowstate == StateMap{
+				if task.working_task_type == TaskMap{
 					reply.DispatchedTaskType = TaskMap
-				} else if temp_nowstate == StateReduce{
+				} else if task.working_task_type == TaskReduce{
 					reply.DispatchedTaskType = TaskReduce
+				} else {
+					reply.DispatchedTaskType = TaskNo
 				}
 				c.working_chan <- task
 				return
