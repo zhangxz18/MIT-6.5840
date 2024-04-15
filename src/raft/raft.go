@@ -56,6 +56,13 @@ const (
 	Leader
 )
 
+type ReceivedTermState int
+const (
+	LargerTerm ReceivedTermState = iota
+	SameTerm
+	SmallerTerm
+)
+
 const ELECTION_TIMEOUT_MAX int = 500
 const ELECTION_TIMEOUT_MIN int = 300
 const HEARTBEAT_INTERVAL int = 100
@@ -95,7 +102,8 @@ type Raft struct {
 	// todo: when to start heartbeat_start_time?
 	election_timeout_start_time time.Time
 	heartbeat_start_time time.Time
-
+	random_election_timeout int
+	random_heartbeat_timeout int
 	got_vote_num int 
 
 	// Lock of currentterm
@@ -184,7 +192,11 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error{
 	// Your code here (2A, 2B).
-	rf.UpdateTerm(args.term)
+	if rf.UpdateTerm(args.term) == SmallerTerm{
+		reply.term = rf.currentTerm
+		reply.voteGranted = false
+		return nil
+	}
 	reply.term = rf.currentTerm
 	reply.voteGranted = false
 	log_ok := (args.lastLogTerm > rf.log[rf.lastApplied].term) || 
@@ -192,13 +204,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 	grant_ok := args.term == rf.currentTerm && log_ok && (rf.votedFor == -1 || rf.votedFor == args.candidateId)
 	// the tla+ code of ongardie writes args.term <= rf.currentTerm here, because there are other operations that can change the term? but if the rf.current term is larger, we dont nned to do it?
 
-	if args.term <= rf.currentTerm{
-		if grant_ok{
-			reply.voteGranted = true
-			rf.votedFor = args.candidateId
-			// restart timer
-			rf.election_timeout_start_time = time.Now()
-		}
+	if grant_ok{
+		reply.voteGranted = true
+		rf.votedFor = args.candidateId
+		rf.reset_election_timer()
 	}
 	return nil
 }
@@ -231,15 +240,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, finish_vote chan int) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	for !ok {
 		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
 	}
-	// just to avoid the finish_vote channel is closed
-	select {
-		case finish_vote <- server:
-		default:
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
+	if rf.UpdateTerm(reply.term) == SameTerm  && reply.voteGranted{
+		rf.got_vote_num += 1
+		if rf.got_vote_num * 2 > len(rf.peers) {
+			rf.become_leader()
+		}
 	}
 	// cannot handle reply here because of the parallelism, do it in the start_election
 	return ok
@@ -260,48 +272,141 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply){
+	for !rf.__sendAppendEntries(server, args, reply){
+		rf.set_prev_log_index_term(server, args)
+		args.entries = rf.log[args.prevLogIndex + 1:]
+		args.leaderCommit = rf.commitIndex
+	}
+}
+
+func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	for !ok {
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}
+	return rf.handleAppendEntriesReply(server, args, reply)
+}
+
+// return false if need to retry
+func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
+	if rf.UpdateTerm(reply.term) != SameTerm{
+		return true
+	}
+	if reply.success{
+		rf.nextIndex[server] = args.prevLogIndex + len(args.entries) + 1
+		rf.matchIndex[server] = rf.nextIndex[server] - 1
+	} else{
+		rf.nextIndex[server] -= 1
+		// retry
+		return false
+	}
+
+	// commitidx update
+	for log_idx := len(rf.log) - 1; log_idx > rf.commitIndex; log_idx--{
+		finish_find_new_commit := false
+		count := 1
+		for peer_idx, matchidx := range rf.matchIndex{
+			if peer_idx != rf.me && matchidx >= log_idx{
+				count += 1
+				if count * 2 > len(rf.peers){
+					rf.commitIndex = log_idx
+					//todo: send commit to follower
+					finish_find_new_commit = true
+					break
+				}
+			}
+		}
+		if finish_find_new_commit{
+			break
+		}
+	} 
+	return true
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error{
-	rf.UpdateTerm(args.term)
-	reply.term = rf.currentTerm
-	reply.success = false
-	if args.term == rf.currentTerm{	
+	if rf.UpdateTerm(args.term) == SmallerTerm{
+		reply.term = rf.currentTerm
+		reply.success = false
+		return nil
 	}
+	if args.prevLogIndex != 0 && (len(rf.log) <= args.prevLogIndex || rf.log[args.prevLogIndex].term != args.prevLogTerm) {
+		reply.term = rf.currentTerm
+		reply.success = false
+		return nil
+	}
+	// 3. write conflict entry
+	start_idx := args.prevLogIndex + 1
+	idx := 0
+	write_idx := start_idx + idx
+	for _, entry := range args.entries {
+		if write_idx < len(rf.log){ 
+			if rf.log[write_idx].term != entry.term{
+				rf.log[write_idx] = entry
+			}
+			idx += 1
+			write_idx += 1
+		} else {
+			break
+		}
+	}
+	// 4. write the remain entry
+	rf.log = append(rf.log, args.entries[idx:]...)
+	// 5. update commit index
+	if args.leaderCommit > rf.commitIndex{
+		newest_index := start_idx + len(args.entries) - 1
+		if args.leaderCommit < newest_index {
+			rf.commitIndex = args.leaderCommit
+		} else {
+			rf.commitIndex = newest_index
+		}
+	}
+	reply.term = rf.currentTerm
+	reply.success = true
 	return nil
 }
 
 // return true if the term is updated
-func (rf *Raft) UpdateTerm(term int) bool{
-	result := false
+func (rf *Raft) UpdateTerm(term int) ReceivedTermState{
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.now_state = Follower
 		rf.votedFor = -1
 		rf.got_vote_num = 0
-		// rf.election_timeout_start_time = time.Now()
-		result = true
+		return LargerTerm
+	} else if term < rf.currentTerm {
+		return SmallerTerm
+	} else {
+		return SameTerm
 	}
-	return result
+}
+
+func (rf *Raft) set_prev_log_index_term(server int, args *AppendEntriesArgs){
+	args.prevLogIndex = rf.nextIndex[server] - 1
+	if args.prevLogIndex < 0{
+		args.prevLogTerm = 0
+	} else {
+		args.prevLogTerm = rf.log[args.prevLogIndex].term
+	}
 }
 
 func (rf *Raft) send_heartbeat() {
-	args := AppendEntriesArgs{
-		term: rf.currentTerm,
-		leaderId: rf.me,
-		prevLogIndex: rf.lastApplied,
-		prevLogTerm: rf.log[rf.lastApplied].term,
-		entries: []LogEntry{},
-		leaderCommit: rf.commitIndex,
-	}
+	rf.reset_heartbeat_timer()
+	args := make([]AppendEntriesArgs, len(rf.peers))
 	replys := make([]AppendEntriesReply, len(rf.peers))
 	for idx := range rf.peers{
 		if idx != rf.me{
-			go rf.sendAppendEntries(idx, &args, &replys[idx])
+			args[idx] = AppendEntriesArgs{
+				term: rf.currentTerm,
+				leaderId: rf.me,
+				entries: []LogEntry{},
+				leaderCommit: rf.commitIndex,
+			}
+			rf.set_prev_log_index_term(idx, &args[idx])
+			go rf.sendAppendEntries(idx, &args[idx], &replys[idx])
 		}
 	}
 }
@@ -347,69 +452,52 @@ func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
 }
+ func (rf *Raft) reset_election_timer() {
+	rf.election_timeout_start_time = time.Now()
+	rf.random_election_timeout = ELECTION_TIMEOUT_MIN + rand.Intn(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN)
+ }
 
+ func (rf *Raft) reset_heartbeat_timer() {
+	rf.heartbeat_start_time = time.Now()
+	rf.random_election_timeout = HEARTBEAT_INTERVAL
+ }
+
+ func (rf *Raft) become_leader() {
+	rf.now_state = Leader
+	rf.got_vote_num = 0 // to avoid other rpc goroutine make it leader again
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for idx := range rf.peers {
+		rf.nextIndex[idx] = len(rf.log)
+		rf.matchIndex[idx] = 0
+	}
+	rf.send_heartbeat()
+}
 
 func (rf *Raft) start_election() {
 	rf.now_state = Candidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.got_vote_num = 1
-	rf.election_timeout_start_time = time.Now()
-	got_replied_num := 1
-	got_replied_map := make(map[int]bool, len(rf.peers)) // use to avoid duplicate reply
-	got_replied_map[rf.me] = true
+	rf.reset_election_timer()
 	replys := make([]RequestVoteReply, len(rf.peers))
-	args := RequestVoteArgs{
-		term: rf.currentTerm,
-		candidateId: rf.me,
-		lastLogIndex: rf.lastApplied,
-		lastLogTerm: rf.log[rf.lastApplied].term,
-	}
-	finish_vote_reply := make(chan int, len(rf.peers) * 2)
-	defer close(finish_vote_reply)
+	args := make([]RequestVoteArgs, len(rf.peers))
 
 	for idx := range rf.peers {
-		if idx == rf.me {
-			continue
+		if idx != rf.me {
+			args[idx] = RequestVoteArgs{
+				term: rf.currentTerm,
+				candidateId: rf.me,
+				lastLogIndex: rf.lastApplied,
+				lastLogTerm: rf.log[rf.lastApplied].term,
+			}
+			go rf.sendRequestVote(idx, &args[idx], &replys[idx])
 		}
-		go rf.sendRequestVote(idx, &args, &replys[idx], finish_vote_reply)
 	} 
-
-	// deal with the replys
-	has_finish := false
-	for  !has_finish && !rf.killed(){
-		replied_server := -1
-		select {
-			case replied_server = <-finish_vote_reply:
-				reply := replys[replied_server]
-				// if reply.term > rf.currentterm, become the follower and still deal with others?
-				if !rf.UpdateTerm(reply.term) {
-					if got_replied_map[replied_server] {
-						continue
-					} else{
-						got_replied_map[replied_server] = true
-						got_replied_num += 1
-						if got_replied_num == len(rf.peers){
-							has_finish = true
-						}
-						if reply.voteGranted{
-							rf.got_vote_num += 1
-							if rf.got_vote_num * 2 > len(rf.peers) {
-								rf.now_state = Leader
-								has_finish = true
-								// todo: send a heartbeat
-							}
-						}
-					}	
-				}
-			default:
-				// do nothing
-		}
-	}
 }
 
 func (rf *Raft) ticker() {
-	random_election_timeout := ELECTION_TIMEOUT_MIN + rand.Intn(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN)
+	rf.reset_election_timer()
 	for !rf.killed() {
 
 		// Your code here (2A)
@@ -417,14 +505,15 @@ func (rf *Raft) ticker() {
 		_, is_leader := rf.GetState()
 
 		if !is_leader {
-			if time.Since(rf.election_timeout_start_time) > time.Duration(random_election_timeout) * time.Millisecond {
-				go rf.start_election()
+			if time.Since(rf.election_timeout_start_time) > time.Duration(rf.random_election_timeout) * time.Millisecond {
+				rf.start_election()	
 			}
 		} else {
-			if time.Since()
-			rf.send_heartbeat()
+			if time.Since(rf.heartbeat_start_time) > time.Duration(rf.random_heartbeat_timeout) * time.Millisecond {
+				rf.send_heartbeat()
+			}
 		}
-		random_election_timeout =  ELECTION_TIMEOUT_MIN + rand.Intn(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN)
+
 		time.Sleep(time.Duration(ELECTION_TICKER_INTERVAL) * time.Millisecond)
 	}
 }
@@ -446,6 +535,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.mu = sync.Mutex{}
+	rf.dead = 0
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = []LogEntry{}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	// will initial when become leader
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+
+	rf.now_state = Follower
+	rf.reset_election_timer()
+	rf.reset_heartbeat_timer()
+
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
