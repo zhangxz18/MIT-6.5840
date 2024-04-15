@@ -336,10 +336,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
-	if rf.UpdateTerm(args.Term) == SmallerTerm{
+	msg_term_state := rf.UpdateTerm(args.Term)
+	if msg_term_state == SmallerTerm{
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
+	// set to follower to stop the election
+	} else if msg_term_state == SameTerm && rf.now_state != Follower{
+		rf.become_follower()
 	}
 	rf.reset_election_timer()
 	if args.PrevLogIndex != 0 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
@@ -383,9 +387,7 @@ func (rf *Raft) UpdateTerm(term int) ReceivedTermState{
 	// defer rf.mu.Unlock()
 	if term > rf.currentTerm {
 		rf.currentTerm = term
-		rf.now_state = Follower
-		rf.votedFor = -1
-		rf.got_vote_num = 0
+		rf.become_follower()
 		return LargerTerm
 	} else if term < rf.currentTerm {
 		return SmallerTerm
@@ -472,7 +474,7 @@ func (rf *Raft) killed() bool {
 	rf.random_election_timeout = HEARTBEAT_INTERVAL
  }
 
- func (rf *Raft) become_leader() {
+func (rf *Raft) become_leader() {
 	rf.now_state = Leader
 	rf.got_vote_num = 0 // to avoid other rpc goroutine make it leader again
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -482,6 +484,12 @@ func (rf *Raft) killed() bool {
 		rf.matchIndex[idx] = 0
 	}
 	rf.send_heartbeat()
+}
+
+func (rf *Raft) become_follower() {
+	rf.now_state = Follower
+	rf.votedFor = -1
+	rf.got_vote_num = 0
 }
 
 func (rf *Raft) start_election() {
