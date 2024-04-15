@@ -342,7 +342,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	// set to follower to stop the election
-	} else if msg_term_state == SameTerm && rf.now_state != Follower{
+	} else if msg_term_state == SameTerm && rf.now_state == Candidate{
 		rf.become_follower()
 	}
 	rf.reset_election_timer()
