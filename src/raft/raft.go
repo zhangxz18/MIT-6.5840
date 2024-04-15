@@ -63,10 +63,10 @@ const (
 	SmallerTerm
 )
 
-const ELECTION_TIMEOUT_MAX int = 500
+const ELECTION_TIMEOUT_MAX int = 600
 const ELECTION_TIMEOUT_MIN int = 300
 const HEARTBEAT_INTERVAL int = 100
-const ELECTION_TICKER_INTERVAL int = 30
+const TICKER_INTERVAL int = 20
 
 type LogEntry struct {
 	Term int
@@ -193,7 +193,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("server %d receive RequestVote from %d, args: %v", rf.me, args.CandidateId, args)
+	// DPrintf("server %d receive RequestVote from %d, args: %v", rf.me, args.CandidateId, args)
+	// DPrintf("server %d now term is %v", rf.me, rf.currentTerm)
 	if rf.UpdateTerm(args.Term) == SmallerTerm{
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -201,8 +202,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 	}
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	log_ok := (args.LastLogTerm > rf.log[rf.lastApplied].Term) || 
-	(args.LastLogTerm == rf.log[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied)
+	last_log_idx := len(rf.log) - 1
+	log_ok := (args.LastLogTerm > rf.log[last_log_idx].Term) || 
+	(args.LastLogTerm == rf.log[last_log_idx].Term && args.LastLogIndex >= last_log_idx)
 	grant_ok := args.Term == rf.currentTerm && log_ok && (rf.votedFor == -1 || rf.votedFor == args.CandidateId)
 	// the tla+ code of ongardie writes args.term <= rf.currentTerm here, because there are other operations that can change the term? but if the rf.current term is larger, we dont nned to do it?
 
@@ -211,6 +213,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 		rf.votedFor = args.CandidateId
 		rf.reset_election_timer()
 	}
+	// DPrintf("server %d reply RequestVote to %d, reply.term:%v, reply.votegranted:%v", rf.me, args.CandidateId, reply.Term, reply.VoteGranted)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -242,17 +245,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 // the struct itself.
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	// DPrintf("server %d send RequestVote to %d, args: %v, now_state: %v", rf.me, server, args, rf.now_state)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	for !ok {
+		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 		reply.Term = 0
 		reply.VoteGranted = false
 		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
 	}
+	// DPrintf("server %d receive RequestVoteReply from %d, reply: %v", rf.me, server, reply)
 	rf.mu.Lock()
-	if rf.UpdateTerm(reply.Term) == SameTerm  && reply.VoteGranted{
-		rf.got_vote_num += 1
-		if rf.got_vote_num * 2 > len(rf.peers) {
-			rf.become_leader()
+	if rf.UpdateTerm(reply.Term) == SameTerm{
+		if args.Term == rf.currentTerm && rf.now_state == Candidate && reply.VoteGranted{
+			rf.got_vote_num += 1
+			// DPrintf("server %d got_vote_num: %d after processing reply from %v", rf.me, rf.got_vote_num, server)
+			if rf.got_vote_num * 2 > len(rf.peers) {
+				rf.become_leader()
+			}
 		}
 	}
 	rf.mu.Unlock()
@@ -287,6 +296,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	for !ok {
+		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}
 	return rf.handleAppendEntriesReply(server, args, reply)
@@ -335,7 +345,6 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
 	msg_term_state := rf.UpdateTerm(args.Term)
 	if msg_term_state == SmallerTerm{
 		reply.Term = rf.currentTerm
@@ -343,7 +352,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	// set to follower to stop the election
 	} else if msg_term_state == SameTerm && rf.now_state == Candidate{
-		rf.become_follower()
+		rf.become_follower(false)
 	}
 	rf.reset_election_timer()
 	if args.PrevLogIndex != 0 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
@@ -387,7 +396,7 @@ func (rf *Raft) UpdateTerm(term int) ReceivedTermState{
 	// defer rf.mu.Unlock()
 	if term > rf.currentTerm {
 		rf.currentTerm = term
-		rf.become_follower()
+		rf.become_follower(true)
 		return LargerTerm
 	} else if term < rf.currentTerm {
 		return SmallerTerm
@@ -486,14 +495,18 @@ func (rf *Raft) become_leader() {
 	rf.send_heartbeat()
 }
 
-func (rf *Raft) become_follower() {
+func (rf *Raft) become_follower(update_vote bool) {
 	rf.now_state = Follower
-	rf.votedFor = -1
-	rf.got_vote_num = 0
+	if update_vote{
+		rf.votedFor = -1
+		rf.got_vote_num = 0
+	}
 }
 
 func (rf *Raft) start_election() {
 	rf.mu.Lock()
+	// DPrintf("server %d start election at %v", rf.me, time.Now())
+	
 	rf.now_state = Candidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
@@ -508,8 +521,8 @@ func (rf *Raft) start_election() {
 			args[idx] = RequestVoteArgs{
 				Term: rf.currentTerm,
 				CandidateId: rf.me,
-				LastLogIndex: rf.lastApplied,
-				LastLogTerm: rf.log[rf.lastApplied].Term,
+				LastLogIndex: len(rf.log) - 1,
+				LastLogTerm: rf.log[len(rf.log) - 1].Term,
 			}
 			go rf.sendRequestVote(idx, &args[idx], &replys[idx])
 		}
@@ -533,7 +546,7 @@ func (rf *Raft) ticker() {
 			}
 		}
 
-		time.Sleep(time.Duration(ELECTION_TICKER_INTERVAL) * time.Millisecond)
+		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 	}
 }
 
