@@ -287,14 +287,22 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	ConflictIndex int
+	ConflictTerm int
+}
+
+func init_reply(reply *AppendEntriesReply){
+	reply.Term = 0
+	reply.Success = false
+	reply.ConflictIndex = 0
+	reply.ConflictTerm = 0
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply){
 	for !rf.__sendAppendEntries(server, args, reply){
 		// todo: check whether it's need to sleep
 		// time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
-		reply.Success = false
-		reply.Term = 0
+		init_reply(reply)
 		rf.set_prev_log_index_term(server, args)
 		args.Entries = rf.log[args.PrevLogIndex + 1:]
 		args.LeaderCommit = rf.commitIndex
@@ -331,9 +339,31 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 		rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 	} else{
-		rf.nextIndex[server] -= 1
-		// retry
-		return false
+		if (reply.ConflictTerm == 0){
+			if(reply.ConflictIndex == 0){
+				rf.nextIndex[server] -= 1 // todo: check need it?
+				return false
+			} else {
+				rf.nextIndex[server] = reply.ConflictIndex
+				return false
+			}
+		} else {
+			same_term_idx := -1
+			for idx := args.PrevLogIndex; idx >= 0; idx --{
+				if rf.log[idx].Term == reply.ConflictTerm{
+					same_term_idx = idx
+					break
+				}
+			}
+			if same_term_idx == -1{
+				rf.nextIndex[server] = reply.ConflictIndex
+				return false
+			} else {
+				rf.nextIndex[server] = same_term_idx + 1
+				return false
+			}
+		}
+
 	}
 
 	// commitidx update
@@ -351,7 +381,6 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 				count += 1
 				if count * 2 > len(rf.peers){
 					rf.commitIndex = log_idx
-					//todo: send commit to follower
 					finish_find_new_commit = true
 					break
 				}
@@ -384,26 +413,41 @@ func (rf *Raft) ApplyMsg2StateMachine(){
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if (len(args.Entries) > 0 || args.LeaderCommit > rf.commitIndex){
-		// Dprintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
-		// Dprintf("server %d now term is %v, logs are %v", rf.me, rf.currentTerm, rf.log)
-	}
 	msg_term_state := rf.UpdateTerm(args.Term)
 	if msg_term_state == SmallerTerm{
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.ConflictIndex = 0
+		reply.ConflictTerm = 0
 		return
 	// set to follower to stop the election
 	} else if msg_term_state == SameTerm && rf.now_state == Candidate{
 		rf.now_state = Follower
 	}
 	rf.reset_election_timer()
-	if args.PrevLogIndex != 0 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		// Dprintf("server %d receive AppendEntries from %d, args: %v, the prevlog is not match", rf.me, args.LeaderId, args)
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
+	if args.PrevLogIndex != 0 {
+		if args.PrevLogIndex >= len(rf.log){
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			reply.ConflictIndex = len(rf.log)
+			reply.ConflictTerm = 0
+			return
+		} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			reply.ConflictIndex = args.PrevLogIndex
+			reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+			for idx := args.PrevLogIndex - 1; idx >= 0; idx--{
+				if (rf.log[idx].Term == reply.ConflictTerm){
+					reply.ConflictIndex -= 1
+				} else {
+					break
+				}
+			}
+			return
+		}
 	}
+
 	// 3. write conflict entry(if a entry is conflict, truncate the log following it)
 	start_idx := args.PrevLogIndex + 1
 	idx := 0
@@ -488,7 +532,6 @@ func (rf *Raft) send_heartbeat() {
 
 func (rf *Raft) send_real_appendentry(){
 	rf.reset_heartbeat_timer()
-	// rf.log = append(rf.log, logs...) // todo: maybe it should be move to start() because of the lock
 	rf.send_appendentries_to_all()
 }
 
