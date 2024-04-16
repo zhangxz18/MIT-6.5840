@@ -249,7 +249,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	// DPrintf("server %d send RequestVote to %d, args: %v, now_state: %v", rf.me, server, args, rf.now_state)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	// only retry when the term is the same and still in candidate state
 	for !ok {
+		if args.Term != rf.currentTerm && rf.now_state != Candidate{
+			return ok
+		}
 		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 		reply.Term = 0
 		reply.VoteGranted = false
@@ -297,9 +301,16 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 }
 
+// return true if don't need to retry
 func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
+	// Dprintf("server %d sendAppendEntries to %d, args: %v", rf.me, server, args)
+	// Dprintf("server %d sendAppendEntries to %d, the logs is %v", rf.me, server, rf.log)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	for !ok {
+	// only retry when the term is the same and still in leader state
+	for !ok{
+		if args.Term != rf.currentTerm && rf.now_state != Candidate{
+			return true // don't retry
+		}
 		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}
@@ -308,6 +319,7 @@ func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *
 
 // return false if need to retry
 func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
+	// Dprintf("server %d receive AppendEntriesReply from %d, reply: %v", rf.me, server, reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// stop retry if become a follower
@@ -356,14 +368,14 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 }
 
 func (rf *Raft) ApplyMsg2StateMachine(){
-	DPrintf("server %d start apply msg to state machine, lastApplied: %d, commitIndex: %d", rf.me, rf.lastApplied, rf.commitIndex)
+	// Dprintf("server %d start apply msg to state machine, lastApplied: %d, commitIndex: %d", rf.me, rf.lastApplied, rf.commitIndex)
 	for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command: rf.log[idx].Command,
 			CommandIndex: idx,
 		}
-		DPrintf("server %d apply msg to state machine, command:%v, idx:%d", rf.me, msg.Command, idx)
+		// Dprintf("server %d apply msg to state machine, command:%v, idx:%d", rf.me, msg.Command, idx)
 		rf.msg_chan <- msg
 		rf.lastApplied += 1
 	}
@@ -373,7 +385,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if (len(args.Entries) > 0 || args.LeaderCommit > rf.commitIndex){
-		DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
+		// Dprintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
+		// Dprintf("server %d now term is %v, logs are %v", rf.me, rf.currentTerm, rf.log)
 	}
 	msg_term_state := rf.UpdateTerm(args.Term)
 	if msg_term_state == SmallerTerm{
@@ -386,18 +399,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.reset_election_timer()
 	if args.PrevLogIndex != 0 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		// Dprintf("server %d receive AppendEntries from %d, args: %v, the prevlog is not match", rf.me, args.LeaderId, args)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-	// 3. write conflict entry
+	// 3. write conflict entry(if a entry is conflict, truncate the log following it)
 	start_idx := args.PrevLogIndex + 1
 	idx := 0
 	write_idx := start_idx + idx
+	// Dprintf("server %d start append entry from %d, start_idx: %d", rf.me, args.LeaderId, start_idx)
 	for _, entry := range args.Entries {
 		if write_idx < len(rf.log){ 
 			if rf.log[write_idx].Term != entry.Term{
-				rf.log[write_idx] = entry
+				rf.log = rf.log[:write_idx]
+				break
 			}
 			idx += 1
 			write_idx += 1
@@ -426,6 +442,7 @@ func (rf *Raft) UpdateTerm(term int) ReceivedTermState{
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
 	if term > rf.currentTerm {
+		// Dprintf("server %d update term from %d to %d", rf.me, rf.currentTerm, term)
 		rf.currentTerm = term
 		rf.now_state = Follower
 		rf.votedFor = -1
