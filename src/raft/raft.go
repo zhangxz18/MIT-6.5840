@@ -70,6 +70,8 @@ const TICKER_INTERVAL int = 20
 
 type LogEntry struct {
 	Term int
+	Index int
+	Command interface{}
 }
 
 // A Go object implementing a single Raft peer.
@@ -104,7 +106,7 @@ type Raft struct {
 	random_election_timeout int
 	random_heartbeat_timeout int
 	got_vote_num int 
-
+	msg_chan chan ApplyMsg
 	// Lock of currentterm
 }
 
@@ -285,6 +287,8 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply){
 	for !rf.__sendAppendEntries(server, args, reply){
+		// todo: check whether it's need to sleep
+		// time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 		reply.Success = false
 		reply.Term = 0
 		rf.set_prev_log_index_term(server, args)
@@ -321,9 +325,15 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 	}
 
 	// commitidx update
-	for log_idx := len(rf.log) - 1; log_idx > rf.commitIndex; log_idx--{
-		finish_find_new_commit := false
+	prev_commit_idx := rf.commitIndex
+	// new_commit_idx := rf.commitIndex
+	finish_find_new_commit := false
+	for log_idx := len(rf.log) - 1; log_idx > prev_commit_idx; log_idx--{
 		count := 1
+		// only commit the entry in the same term
+		if rf.log[log_idx].Term != rf.currentTerm{
+			break
+		}
 		for peer_idx, matchidx := range rf.matchIndex{
 			if peer_idx != rf.me && matchidx >= log_idx{
 				count += 1
@@ -339,12 +349,30 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 			break
 		}
 	} 
+	if finish_find_new_commit{
+		rf.ApplyMsg2StateMachine()
+	}
 	return true
+}
+
+func (rf *Raft) ApplyMsg2StateMachine(){
+	DPrintf("server %d start apply msg to state machine, lastApplied: %d, commitIndex: %d", rf.me, rf.lastApplied, rf.commitIndex)
+	for idx := rf.lastApplied + 1; idx <= rf.commitIndex; idx++ {
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command: rf.log[idx].Command,
+			CommandIndex: idx,
+		}
+		DPrintf("server %d apply msg to state machine, command:%v, idx:%d", rf.me, msg.Command, idx)
+		rf.msg_chan <- msg
+		rf.lastApplied += 1
+	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
 	msg_term_state := rf.UpdateTerm(args.Term)
 	if msg_term_state == SmallerTerm{
 		reply.Term = rf.currentTerm
@@ -352,7 +380,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	// set to follower to stop the election
 	} else if msg_term_state == SameTerm && rf.now_state == Candidate{
-		rf.become_follower(false)
+		rf.now_state = Follower
 	}
 	rf.reset_election_timer()
 	if args.PrevLogIndex != 0 && (len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
@@ -385,6 +413,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = newest_index
 		}
+		rf.ApplyMsg2StateMachine()
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -396,7 +425,9 @@ func (rf *Raft) UpdateTerm(term int) ReceivedTermState{
 	// defer rf.mu.Unlock()
 	if term > rf.currentTerm {
 		rf.currentTerm = term
-		rf.become_follower(true)
+		rf.now_state = Follower
+		rf.votedFor = -1
+		rf.got_vote_num = 0
 		return LargerTerm
 	} else if term < rf.currentTerm {
 		return SmallerTerm
@@ -414,8 +445,7 @@ func (rf *Raft) set_prev_log_index_term(server int, args *AppendEntriesArgs){
 	}
 }
 
-func (rf *Raft) send_heartbeat() {
-	rf.reset_heartbeat_timer()
+func (rf *Raft) send_appendentries_to_all(logs []LogEntry){
 	args := make([]AppendEntriesArgs, len(rf.peers))
 	replys := make([]AppendEntriesReply, len(rf.peers))
 	for idx := range rf.peers{
@@ -423,13 +453,24 @@ func (rf *Raft) send_heartbeat() {
 			args[idx] = AppendEntriesArgs{
 				Term: rf.currentTerm,
 				LeaderId: rf.me,
-				Entries: []LogEntry{},
+				Entries: logs,
 				LeaderCommit: rf.commitIndex,
 			}
 			rf.set_prev_log_index_term(idx, &args[idx])
 			go rf.sendAppendEntries(idx, &args[idx], &replys[idx])
 		}
 	}
+}
+
+func (rf *Raft) send_heartbeat() {
+	rf.reset_heartbeat_timer()
+	rf.send_appendentries_to_all([]LogEntry{})
+}
+
+func (rf *Raft) send_real_appendentry(logs []LogEntry){
+	rf.reset_heartbeat_timer()
+	rf.log = append(rf.log, logs...) // todo: maybe it should be move to start() because of the lock
+	rf.send_appendentries_to_all(logs)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -450,8 +491,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
-
+	if rf.now_state != Leader{
+		isLeader = false
+	} else {
+		// need lock? yes, to avoid write in different places
+		rf.mu.Lock()
+		index = len(rf.log)
+		term = rf.currentTerm
+		isLeader = true
+		logs := []LogEntry{{Term: term, Index: index, Command: command}}
+		go rf.send_real_appendentry(logs)
+		rf.mu.Unlock()
+	}
 	return index, term, isLeader
 }
 
@@ -493,14 +544,6 @@ func (rf *Raft) become_leader() {
 		rf.matchIndex[idx] = 0
 	}
 	rf.send_heartbeat()
-}
-
-func (rf *Raft) become_follower(update_vote bool) {
-	rf.now_state = Follower
-	if update_vote{
-		rf.votedFor = -1
-		rf.got_vote_num = 0
-	}
 }
 
 func (rf *Raft) start_election() {
@@ -572,7 +615,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = []LogEntry{{Term: 0}}
+	rf.log = []LogEntry{{Term: 0, Index: 0, Command: nil}}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	// will initial when become leader
@@ -582,6 +625,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.now_state = Follower
 	rf.reset_election_timer()
 	rf.reset_heartbeat_timer()
+	rf.msg_chan = applyCh
 
 
 	// initialize from state persisted before a crash
