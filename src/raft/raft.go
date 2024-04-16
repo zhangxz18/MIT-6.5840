@@ -317,7 +317,7 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 	}
 	if reply.Success{
 		rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-		rf.matchIndex[server] = rf.nextIndex[server] - 1
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 	} else{
 		rf.nextIndex[server] -= 1
 		// retry
@@ -372,7 +372,9 @@ func (rf *Raft) ApplyMsg2StateMachine(){
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
+	if (len(args.Entries) > 0 || args.LeaderCommit > rf.commitIndex){
+		DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
+	}
 	msg_term_state := rf.UpdateTerm(args.Term)
 	if msg_term_state == SmallerTerm{
 		reply.Term = rf.currentTerm
@@ -445,7 +447,7 @@ func (rf *Raft) set_prev_log_index_term(server int, args *AppendEntriesArgs){
 	}
 }
 
-func (rf *Raft) send_appendentries_to_all(logs []LogEntry){
+func (rf *Raft) send_appendentries_to_all(){
 	args := make([]AppendEntriesArgs, len(rf.peers))
 	replys := make([]AppendEntriesReply, len(rf.peers))
 	for idx := range rf.peers{
@@ -453,10 +455,10 @@ func (rf *Raft) send_appendentries_to_all(logs []LogEntry){
 			args[idx] = AppendEntriesArgs{
 				Term: rf.currentTerm,
 				LeaderId: rf.me,
-				Entries: logs,
 				LeaderCommit: rf.commitIndex,
 			}
 			rf.set_prev_log_index_term(idx, &args[idx])
+			args[idx].Entries = rf.log[rf.nextIndex[idx]:]
 			go rf.sendAppendEntries(idx, &args[idx], &replys[idx])
 		}
 	}
@@ -464,13 +466,13 @@ func (rf *Raft) send_appendentries_to_all(logs []LogEntry){
 
 func (rf *Raft) send_heartbeat() {
 	rf.reset_heartbeat_timer()
-	rf.send_appendentries_to_all([]LogEntry{})
+	rf.send_appendentries_to_all()
 }
 
 func (rf *Raft) send_real_appendentry(logs []LogEntry){
 	rf.reset_heartbeat_timer()
 	rf.log = append(rf.log, logs...) // todo: maybe it should be move to start() because of the lock
-	rf.send_appendentries_to_all(logs)
+	rf.send_appendentries_to_all()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
