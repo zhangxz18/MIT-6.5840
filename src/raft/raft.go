@@ -469,9 +469,9 @@ func (rf *Raft) send_heartbeat() {
 	rf.send_appendentries_to_all()
 }
 
-func (rf *Raft) send_real_appendentry(logs []LogEntry){
+func (rf *Raft) send_real_appendentry(){
 	rf.reset_heartbeat_timer()
-	rf.log = append(rf.log, logs...) // todo: maybe it should be move to start() because of the lock
+	// rf.log = append(rf.log, logs...) // todo: maybe it should be move to start() because of the lock
 	rf.send_appendentries_to_all()
 }
 
@@ -502,7 +502,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		isLeader = true
 		logs := []LogEntry{{Term: term, Index: index, Command: command}}
-		go rf.send_real_appendentry(logs)
+		rf.log = append(rf.log, logs...)
+		go rf.send_real_appendentry()
 		rf.mu.Unlock()
 	}
 	return index, term, isLeader
