@@ -534,7 +534,7 @@ func (rf *Raft) killed() bool {
 
  func (rf *Raft) reset_heartbeat_timer() {
 	rf.heartbeat_start_time = time.Now()
-	rf.random_election_timeout = HEARTBEAT_INTERVAL
+	rf.random_heartbeat_timeout = HEARTBEAT_INTERVAL
  }
 
 func (rf *Raft) become_leader() {
