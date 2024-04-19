@@ -1,9 +1,12 @@
 # My solution for MIT 65840
 
 
-## Problems
+## Notes
 ### Lab 1
 + 记得在每次发送RPC前重置Reply。因为空值在RPC里会被压缩。如果不重置，server往reply里写的0会被压缩掉，client会在收到reply后保持原有值。
+
++ 用-race跑会报一些读写冲突，但不影响正确性。（只是可能分配已经完成的任务出去）
+
 ### Lab2A
 +  如果把ticker的唤醒间隔设置为10ms或更低，就无法通过LAB 2A many_election test，会大概率在某一阶段无法选出leader。  
 解决办法：在resent rpc的循环中也休眠一段时间再发（可能是因为一些服务器disconnected以后，发送rpc的goroutine频繁重试，占用过多cpu时间）

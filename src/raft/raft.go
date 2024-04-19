@@ -71,6 +71,7 @@ const ELECTION_TIMEOUT_MAX int = 600
 const ELECTION_TIMEOUT_MIN int = 300
 const HEARTBEAT_INTERVAL int = 100
 const TICKER_INTERVAL int = 20
+const RESEND_WHEN_LOG_CONFLICT_INTERVAL int = 10
 
 type LogEntry struct {
 	Term int
@@ -85,6 +86,8 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+
+	timer_mu sync.Mutex
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -120,6 +123,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var term int
 	var isleader bool
 	// Your code here (2A).
@@ -232,8 +237,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.Log = []LogEntry{{Term: rf.LastSnapshotLogTerm, Index: index, Command: nil}}
 	rf.Log = append(rf.Log, templog...)
 	// fmt.Printf("server %d snapshot at index %d, now log length: %d\n", rf.me, index, rf.GetLogLength())
-	fmt.Printf("server %d snapshot at index %d, now log: ???\n", rf.me, index)
-	fmt.Printf("start snapshot\n")
+	// fmt.Printf("server %d snapshot at index %d, now log: ???\n", rf.me, index)
+	// fmt.Printf("start snapshot\n")
 	rf.persist()
 
 
@@ -261,6 +266,43 @@ type InstallSnapshotArgs struct{
 
 type InstallSnapshotReply struct{
 	Term int
+	OriginalLastSnapLogIndex int
+}
+
+func (rf *Raft) CutLogFromSnapshot(LastIncludedIndex int, LastIncludedTerm int){
+	if LastIncludedIndex > rf.GetLogLength() - 1{
+		rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}
+		rf.LastSnapshotLogIndex = LastIncludedIndex
+		rf.LastSnapshotLogTerm = LastIncludedTerm
+	} else {
+		temp_log := rf.GetLogSlices(rf.LastSnapshotLogIndex + 1, -1)
+		rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}
+		rf.Log = append(rf.Log, temp_log...)
+		rf.LastSnapshotLogIndex = LastIncludedIndex
+		rf.LastSnapshotLogTerm = LastIncludedTerm
+	}
+	rf.persist()
+}
+
+func (rf *Raft)InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.UpdateTerm(args.Term) == SmallerTerm{
+		reply.Term = rf.CurrentTerm
+		return
+	}
+	// don't need to reply in fact? but cannot implement...
+	if args.LastIncludedIndex <= rf.LastSnapshotLogIndex{
+		reply.Term = rf.CurrentTerm
+		reply.OriginalLastSnapLogIndex = rf.LastSnapshotLogIndex
+		return
+	}
+	rf.CutLogFromSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
+	// 2. save snapshot file, discard any existing or partial snapshot with a smaller index
+	// 3. if existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
+	// 4. discard the entire log
+	// 5. reset state machine using snapshot contents
+	// 6. reply
 }
 
 
@@ -344,9 +386,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	// only retry when the term is the same and still in candidate state
 	for !ok {
-		if args.Term != rf.CurrentTerm && rf.now_state != Candidate{
+		rf.mu.Lock()
+		if args.Term != rf.CurrentTerm || rf.now_state != Candidate{
+			rf.mu.Unlock()
 			return ok
 		}
+		rf.mu.Unlock()
 		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 		reply.Term = 0
 		reply.VoteGranted = false
@@ -396,29 +441,39 @@ func (rf *Raft) sendAppendEntries(server int){
 		args := AppendEntriesArgs{}
 		reply := AppendEntriesReply{}
 		init_reply(&reply)
+		rf.mu.Lock()
+		if rf.now_state != Leader{
+			rf.mu.Unlock()
+			return
+		}
 		args.Term = rf.CurrentTerm
 		args.LeaderId = rf.me
 		rf.set_prev_log_index_term(server, &args)
 		args.Entries = rf.GetLogSlices(args.PrevLogIndex + 1, -1)
 		args.LeaderCommit = rf.CommitIndex
+		rf.mu.Unlock()
 		if rf.__sendAppendEntries(server, &args, &reply){
 			break
 		} else {
-			// don't let it sleep, which will result in a error
-			// time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
+			time.Sleep(time.Duration(RESEND_WHEN_LOG_CONFLICT_INTERVAL) * time.Millisecond)
 		}
 	}
 }
 
 // return true if don't need to retry
 func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
-	DPrintf("server %d sendAppendEntries to %d, args: %v", rf.me, server, args)
+	if len(args.Entries) > 0 {
+		DPrintf("server %d sendAppendEntries to %d, args: %v", rf.me, server, args)
+	}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	// only retry when the term is the same and still in leader state
 	for !ok{
-		if args.Term != rf.CurrentTerm && rf.now_state != Candidate{
+		rf.mu.Lock()
+		if args.Term != rf.CurrentTerm || rf.now_state != Leader{
+			rf.mu.Unlock()
 			return true // don't retry
 		}
+		rf.mu.Unlock()
 		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}
@@ -441,8 +496,8 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 	} else{
 		if (reply.ConflictTerm == 0){
 			if(reply.ConflictIndex == 0){
-				rf.NextIndex[server] -= 1 // todo: check need it?
-				return false
+				// rf.NextIndex[server] -= 1 // todo: check need it?
+				return true
 			} else {
 				rf.NextIndex[server] = reply.ConflictIndex
 				return false
@@ -483,6 +538,7 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 			if peer_idx != rf.me && matchidx >= log_idx{
 				count += 1
 				if count * 2 > len(rf.peers){
+					DPrintf("server %d chang commit index:%v -> %v", rf.me, prev_commit_idx, log_idx)
 					rf.CommitIndex = log_idx
 					finish_find_new_commit = true
 					break
@@ -500,16 +556,16 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 }
 
 func (rf *Raft) ApplyMsg2StateMachine(){
-	// Dprintf("server %d start apply msg to state machine, lastApplied: %d, commitIndex: %d", rf.me, rf.lastApplied, rf.commitIndex)
+	DPrintf("server %d start apply msg to state machine, lastApplied: %d, commitIndex: %d", rf.me, rf.LastApplied, rf.CommitIndex)
 	for idx := rf.LastApplied + 1; idx <= rf.CommitIndex; idx++ {
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command: rf.GetLogByIndex(idx).Command,
 			CommandIndex: idx,
 		}
-		// Dprintf("server %d apply msg to state machine, command:%v, idx:%d", rf.me, msg.Command, idx)
+		DPrintf("server %d apply msg to state machine, command:%v, idx:%d", rf.me, msg.Command, idx)
 		rf.msg_chan <- msg
-		rf.LastApplied += 1
+		rf.LastApplied = idx
 	}
 }
 
@@ -581,6 +637,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.CommitIndex = newest_index
 		}
+		DPrintf("server %d chang commit index: to %v", rf.me, rf.CommitIndex)
 		rf.ApplyMsg2StateMachine()
 	}
 	reply.Term = rf.CurrentTerm
@@ -688,16 +745,21 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
  func (rf *Raft) reset_election_timer() {
+	rf.timer_mu.Lock()
+	defer rf.timer_mu.Unlock()
 	rf.election_timeout_start_time = time.Now()
 	rf.random_election_timeout = ELECTION_TIMEOUT_MIN + rand.Intn(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN)
  }
 
  func (rf *Raft) reset_heartbeat_timer() {
+	rf.timer_mu.Lock()
+	defer rf.timer_mu.Unlock()
 	rf.heartbeat_start_time = time.Now()
 	rf.random_heartbeat_timeout = HEARTBEAT_INTERVAL
  }
 
 func (rf *Raft) become_leader() {
+	DPrintf("server %d become leader of term%v\n", rf.me, rf.CurrentTerm)
 	rf.now_state = Leader
 	rf.got_vote_num = 0 // to avoid other rpc goroutine make it leader again
 	rf.NextIndex = make([]int, len(rf.peers))
@@ -722,7 +784,7 @@ func (rf *Raft) start_election() {
 	rf.reset_election_timer()
 	replys := make([]RequestVoteReply, len(rf.peers))
 	args := make([]RequestVoteArgs, len(rf.peers))
-
+	rf.mu.Lock()
 	for idx := range rf.peers {
 		if idx != rf.me {
 			args[idx] = RequestVoteArgs{
@@ -734,6 +796,7 @@ func (rf *Raft) start_election() {
 			go rf.sendRequestVote(idx, &args[idx], &replys[idx])
 		}
 	} 
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) ticker() {
@@ -743,13 +806,22 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		// todo: lock?
-		if rf.now_state != Leader {
+		_, isleader := rf.GetState()
+		if !isleader {
+			rf.timer_mu.Lock()
 			if time.Since(rf.election_timeout_start_time) > time.Duration(rf.random_election_timeout) * time.Millisecond {
+				rf.timer_mu.Unlock()
 				rf.start_election()	
+			} else {
+				rf.timer_mu.Unlock()
 			}
 		} else {
+			rf.timer_mu.Lock()
 			if time.Since(rf.heartbeat_start_time) > time.Duration(rf.random_heartbeat_timeout) * time.Millisecond {
+				rf.timer_mu.Unlock()
 				rf.send_heartbeat()
+			} else {
+				rf.timer_mu.Unlock()
 			}
 		}
 
@@ -775,6 +847,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.mu = sync.Mutex{}
+	rf.timer_mu = sync.Mutex{}
 	rf.dead = 0
 
 	rf.CurrentTerm = 0
