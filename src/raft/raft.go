@@ -139,6 +139,10 @@ func (rf *Raft) GetLogLength() int {
 	return rf.LastSnapshotLogIndex + len(rf.Log)
 }
 
+func (rf *Raft) GetLastLogIndex() int {
+	return rf.LastSnapshotLogIndex + len(rf.Log) - 1
+}
+
 func (rf *Raft) GetLogByIndex(idx int) LogEntry{
 	return rf.Log[idx - rf.LastSnapshotLogIndex]
 }
@@ -149,12 +153,6 @@ func (rf *Raft) SetLogByIndex(idx int, entry LogEntry){
 
 // only return a slices from the current log
 func (rf *Raft) GetLogSlices(start int, end int) []LogEntry{
-	// todo: when start from -1?
-	// if (start >= rf.GetLogLength()){
-	// 	fmt.Printf("GetLogSlices: start %v is larger than log length %v\n", start, rf.GetLogLength())
-		
-	// 	return []LogEntry{}
-	// }
 	if (end == -1){
 		return rf.Log[start - rf.LastSnapshotLogIndex:]
 	} else if(start == -1){
@@ -237,9 +235,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	templog := rf.GetLogSlices(index + 1, -1) 
 	rf.Log = []LogEntry{{Term: rf.LastSnapshotLogTerm, Index: index, Command: nil}}
 	rf.Log = append(rf.Log, templog...)
-	// fmt.Printf("server %d snapshot at index %d, now log length: %d\n", rf.me, index, rf.GetLogLength())
-	// fmt.Printf("server %d snapshot at index %d, now log: ???\n", rf.me, index)
-	// fmt.Printf("start snapshot\n")
 	rf.persist()
 
 
@@ -271,7 +266,7 @@ type InstallSnapshotReply struct{
 }
 
 func (rf *Raft) CutLogFromSnapshot(LastIncludedIndex int, LastIncludedTerm int){
-	if LastIncludedIndex > rf.GetLogLength() - 1{
+	if LastIncludedIndex > rf.GetLastLogIndex(){
 		rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}
 		rf.LastSnapshotLogIndex = LastIncludedIndex
 		rf.LastSnapshotLogTerm = LastIncludedTerm
@@ -339,7 +334,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 	}
 	reply.Term = rf.CurrentTerm
 	reply.VoteGranted = false
-	last_log_idx := rf.GetLogLength() - 1
+	last_log_idx := rf.GetLastLogIndex()
 	log_ok := (args.LastLogTerm > rf.GetLogByIndex(last_log_idx).Term) || 
 	(args.LastLogTerm == rf.GetLogByIndex(last_log_idx).Term && args.LastLogIndex >= last_log_idx)
 	grant_ok := args.Term == rf.CurrentTerm && log_ok && (rf.VotedFor == -1 || rf.VotedFor == args.CandidateId)
@@ -528,7 +523,7 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 	prev_commit_idx := rf.CommitIndex
 	// new_commit_idx := rf.commitIndex
 	finish_find_new_commit := false
-	for log_idx := rf.GetLogLength() - 1; log_idx > prev_commit_idx; log_idx--{
+	for log_idx := rf.GetLastLogIndex(); log_idx > prev_commit_idx; log_idx--{
 		count := 1
 		// only commit the entry in the same term
 		if rf.GetLogByIndex(log_idx).Term != rf.CurrentTerm{
@@ -587,10 +582,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.reset_election_timer()
 	if args.PrevLogIndex != 0 {
-		if args.PrevLogIndex >= rf.GetLogLength(){
+		if args.PrevLogIndex > rf.GetLastLogIndex(){
 			reply.Term = rf.CurrentTerm
 			reply.Success = false
-			reply.ConflictIndex = rf.GetLogLength()
+			reply.ConflictIndex = rf.GetLastLogIndex() + 1
 			reply.ConflictTerm = 0
 			return
 		} else if rf.GetLogByIndex(args.PrevLogIndex).Term != args.PrevLogTerm {
@@ -615,7 +610,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	write_idx := start_idx + idx
 	// // DPrintf("server %d start append entry from %d, start_idx: %d", rf.me, args.LeaderId, start_idx)
 	for _, entry := range args.Entries {
-		if write_idx < rf.GetLogLength(){ 
+		if write_idx <= rf.GetLastLogIndex(){ 
 			if rf.GetLogByIndex(write_idx).Term != entry.Term{
 				rf.Log = rf.GetLogSlices(-1, write_idx)
 				break
@@ -714,7 +709,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 	} else {
 		// need lock? yes, to avoid write in different places
-		index = rf.GetLogLength()
+		index = rf.GetLastLogIndex() + 1
 		term = rf.CurrentTerm
 		isLeader = true
 		logs := []LogEntry{{Term: term, Index: index, Command: command}}
@@ -765,7 +760,7 @@ func (rf *Raft) become_leader() {
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
 	for idx := range rf.peers {
-		rf.NextIndex[idx] = rf.GetLogLength()
+		rf.NextIndex[idx] = rf.GetLastLogIndex() + 1
 		rf.MatchIndex[idx] = 0
 	}
 	rf.send_heartbeat()
@@ -785,8 +780,8 @@ func (rf *Raft) start_election() {
 	args := RequestVoteArgs{
 		Term: rf.CurrentTerm,
 		CandidateId: rf.me,
-		LastLogIndex: rf.GetLogLength() - 1,
-		LastLogTerm: rf.GetLogByIndex(rf.GetLogLength() - 1).Term,
+		LastLogIndex: rf.GetLastLogIndex(),
+		LastLogTerm: rf.GetLogByIndex(rf.GetLastLogIndex()).Term,
 	}
 	rf.mu.Unlock()
 	for idx := range rf.peers {
