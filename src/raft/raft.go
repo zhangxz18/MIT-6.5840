@@ -177,9 +177,10 @@ func (rf *Raft) persist() {
 	e.Encode(rf.Log)
 	e.Encode(rf.LastSnapshotLogIndex)
 	e.Encode(rf.LastSnapshotLogTerm)
-	e.Encode(rf.SnapshotData)
+	// e.Encode(rf.SnapshotData)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+
+	rf.persister.Save(raftstate, rf.SnapshotData)
 }
 
 
@@ -196,13 +197,11 @@ func (rf *Raft) readPersist(data []byte) {
 	var saved_logs []LogEntry
 	var saved_last_snapshot_log_index int
 	var saved_last_snapshot_log_term int
-	var saved_snapshot_data []byte
 	if d.Decode(&saved_term) != nil ||
 	   d.Decode(&saved_votefor) != nil ||
 	   d.Decode(&saved_logs) != nil ||
 	   d.Decode(&saved_last_snapshot_log_index) != nil ||
-	   d.Decode(&saved_last_snapshot_log_term) != nil ||
-	   d.Decode(&saved_snapshot_data) != nil{
+	   d.Decode(&saved_last_snapshot_log_term) != nil {
 		fmt.Printf("Decode error\n")
 		return
 	} else {
@@ -211,7 +210,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.Log = saved_logs
 		rf.LastSnapshotLogIndex = saved_last_snapshot_log_index
 		rf.LastSnapshotLogTerm = saved_last_snapshot_log_term
-		rf.SnapshotData = clone(saved_snapshot_data)
+		rf.CommitIndex = rf.LastSnapshotLogIndex
+		rf.LastApplied = rf.LastSnapshotLogIndex
+		rf.SnapshotData = rf.persister.ReadSnapshot()
 	}
 }
 
@@ -227,17 +228,23 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index <= rf.LastSnapshotLogIndex {
 		return
 	}
-	rf.LastSnapshotLogTerm = rf.GetLogByIndex(index).Term
-	rf.LastSnapshotLogIndex = index
-	rf.SnapshotData = clone(snapshot)
+	if index > rf.GetLastLogIndex(){
+		fmt.Printf("Snapshot: index %v > last_log_index%v\n", index, rf.GetLastLogIndex())
+		return
+	}
 	// trim the log
 	// to avoid the index out of range, we need to add 1(because Raft think the log is start from 1)
-	templog := rf.GetLogSlices(index + 1, -1) 
-	rf.Log = []LogEntry{{Term: rf.LastSnapshotLogTerm, Index: index, Command: nil}}
-	rf.Log = append(rf.Log, templog...)
+	last_term := rf.GetLogByIndex(index).Term
+	rf.CutLogWithSnapshot(index, last_term)
+	rf.LastSnapshotLogTerm = last_term
+	rf.LastSnapshotLogIndex = index
+	rf.SnapshotData = clone(snapshot)
+	// todo: check need it?
+	if (rf.LastApplied < rf.LastSnapshotLogIndex){
+		rf.LastApplied = rf.LastSnapshotLogIndex
+	}
+
 	rf.persist()
-
-
 	// w := new(bytes.Buffer)
 	// e := labgob.NewEncoder(w)
 	// e.Encode(rf.LastSnapshotLogIndex)
@@ -246,8 +253,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// rf.LastSnapshotLogIndex = index
 	// rf.LastSnapshotLogTerm = rf.GetLogByIndex(index).Term
 	// rf.SnapshotData = clone(snapshot_data)
-
-
 }
 
 type InstallSnapshotArgs struct{
@@ -257,48 +262,97 @@ type InstallSnapshotArgs struct{
 	LastIncludedTerm int
 	// Offset int // always be zero
 	// Done bool // always be true
-	data []byte
+	Data []byte
 }
 
 type InstallSnapshotReply struct{
 	Term int
-	OriginalLastSnapLogIndex int
+	NewSnapLogIndex int
 }
 
-func (rf *Raft) CutLogFromSnapshot(LastIncludedIndex int, LastIncludedTerm int){
+func (rf *Raft) CutLogWithSnapshot(LastIncludedIndex int, LastIncludedTerm int){
+	// set idx 0 to {Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil} to avoid special judge in the appendentries
 	if LastIncludedIndex > rf.GetLastLogIndex(){
-		rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}
-		rf.LastSnapshotLogIndex = LastIncludedIndex
-		rf.LastSnapshotLogTerm = LastIncludedTerm
+		rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}	
 	} else {
-		temp_log := rf.GetLogSlices(rf.LastSnapshotLogIndex + 1, -1)
-		rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}
-		rf.Log = append(rf.Log, temp_log...)
-		rf.LastSnapshotLogIndex = LastIncludedIndex
-		rf.LastSnapshotLogTerm = LastIncludedTerm
+		if (LastIncludedTerm != rf.GetLogByIndex(LastIncludedIndex).Term){
+			rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}
+		} else {
+			temp_log := rf.GetLogSlices(LastIncludedIndex + 1, -1)
+			rf.Log = []LogEntry{{Term: LastIncludedTerm, Index: LastIncludedIndex, Command: nil}}
+			rf.Log = append(rf.Log, temp_log...)
+		}
 	}
-	rf.persist()
 }
 
-func (rf *Raft)InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply){
+func (rf *Raft) write_data_to_applychan(msg ApplyMsg){
+	rf.msg_chan <- msg
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	if msg.SnapshotIndex > rf.LastApplied{
+		rf.LastApplied = msg.SnapshotIndex
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) SendInstallSnapshot(server int){
+	rf.mu.Lock()
+	args := InstallSnapshotArgs{
+		Term: rf.CurrentTerm,
+		LeaderId: rf.me,
+		LastIncludedIndex: rf.LastSnapshotLogIndex,
+		LastIncludedTerm: rf.LastSnapshotLogTerm,
+		Data: clone(rf.SnapshotData),
+	}
+	reply := InstallSnapshotReply{}
+	rf.mu.Unlock()
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
+	if ok{
+		rf.mu.Lock()
+		if rf.UpdateTerm(reply.Term) == LargerTerm{
+			rf.now_state = Follower
+		} else if reply.NewSnapLogIndex > args.LastIncludedIndex {
+			// only the commit data can be snapshoted, so previous data is same
+			// only to prevent packet loss
+			// do nothing
+			// rf.NextIndex[server] = reply.NewSnapLogIndex + 1 
+		} else{
+			rf.MatchIndex[server] = args.LastIncludedIndex
+			rf.NextIndex[server] = args.LastIncludedIndex + 1
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply){
+	rf.mu.Lock()
 	if rf.UpdateTerm(args.Term) == SmallerTerm{
 		reply.Term = rf.CurrentTerm
 		return
 	}
+	reply.Term = rf.CurrentTerm
 	// don't need to reply in fact? but cannot implement...
 	if args.LastIncludedIndex <= rf.LastSnapshotLogIndex{
-		reply.Term = rf.CurrentTerm
-		reply.OriginalLastSnapLogIndex = rf.LastSnapshotLogIndex
+		reply.NewSnapLogIndex = rf.LastSnapshotLogIndex
 		return
 	}
-	rf.CutLogFromSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
-	// 2. save snapshot file, discard any existing or partial snapshot with a smaller index
-	// 3. if existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
-	// 4. discard the entire log
-	// 5. reset state machine using snapshot contents
-	// 6. reply
+	msg := ApplyMsg{
+		CommandValid: false,
+		SnapshotValid: true,
+		Snapshot: args.Data,
+		SnapshotTerm: args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+	rf.CutLogWithSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
+	rf.SnapshotData = clone(args.Data)
+	rf.LastSnapshotLogTerm = args.LastIncludedTerm
+	rf.LastSnapshotLogIndex = args.LastIncludedIndex
+	if args.LastIncludedIndex > rf.CommitIndex{
+		rf.CommitIndex = args.LastIncludedIndex
+	}
+	reply.NewSnapLogIndex = rf.LastSnapshotLogIndex
+	rf.persist()
+	rf.mu.Unlock()
+	go rf.write_data_to_applychan(msg)
 }
 
 
@@ -431,28 +485,42 @@ func init_reply(reply *AppendEntriesReply){
 	reply.ConflictTerm = 0
 }
 
+func (rf *Raft) check_need_send_snapshot(server int) bool{
+	return rf.NextIndex[server] <= rf.LastSnapshotLogIndex
+}
+
 func (rf *Raft) sendAppendEntries(server int){
 	for{
-		args := AppendEntriesArgs{}
-		reply := AppendEntriesReply{}
-		init_reply(&reply)
 		rf.mu.Lock()
 		if rf.now_state != Leader{
 			rf.mu.Unlock()
 			return
 		}
-		args.Term = rf.CurrentTerm
-		args.LeaderId = rf.me
-		rf.set_prev_log_index_term(server, &args)
-		args.Entries = rf.GetLogSlices(args.PrevLogIndex + 1, -1)
-		args.LeaderCommit = rf.CommitIndex
-		rf.mu.Unlock()
-		if rf.__sendAppendEntries(server, &args, &reply){
-			break
+		need_send_snapshot := rf.check_need_send_snapshot(server)
+		if (need_send_snapshot){
+			// args := InstallSnapshotArgs{
+			// 	Term: rf.CurrentTerm,
+			// 	LeaderId: rf.me,
+			// 	LastIncludedIndex: rf.LastSnapshotLogIndex,
+			// 	LastIncludedTerm: rf.LastSnapshotLogTerm,
+			// 	data: clone(rf.SnapshotData),
+			// }
+			// reply := InstallSnapshotReply{}
+			rf.mu.Unlock()
+			rf.SendInstallSnapshot(server)
 		} else {
-			// don't need to sleep, so that the retry can be done as soon as possible
-			// otherwise it will exceed the time limit in Lab 2C TestUnreliableChurn2C
-			// time.Sleep(time.Duration(RESEND_WHEN_LOG_CONFLICT_INTERVAL) * time.Millisecond)
+			args := AppendEntriesArgs{}
+			reply := AppendEntriesReply{}
+			init_reply(&reply)
+			args.Term = rf.CurrentTerm
+			args.LeaderId = rf.me
+			rf.set_prev_log_index_term(server, &args)
+			args.Entries = rf.GetLogSlices(args.PrevLogIndex + 1, -1)
+			args.LeaderCommit = rf.CommitIndex
+			rf.mu.Unlock()
+			if rf.__sendAppendEntries(server, &args, &reply){
+				break
+			}
 		}
 	}
 }
@@ -499,10 +567,7 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 			}
 		} else {
 			same_term_idx := -1
-			for idx := args.PrevLogIndex; idx >= 0; idx --{
-				if idx <= rf.LastSnapshotLogIndex{
-					//
-				}
+			for idx := args.PrevLogIndex; idx >= rf.LastSnapshotLogIndex; idx --{
 				if rf.GetLogByIndex(idx).Term == reply.ConflictTerm{
 					same_term_idx = idx
 					break
@@ -567,8 +632,8 @@ func (rf *Raft) ApplyMsg2StateMachine(){
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
-	// DPrintf("server %d now Log is %v", rf.me, rf.Log)
+	DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
+	DPrintf("server %d now Log is %v", rf.me, rf.Log)
 	msg_term_state := rf.UpdateTerm(args.Term)
 	if msg_term_state == SmallerTerm{
 		reply.Term = rf.CurrentTerm
@@ -826,7 +891,6 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		// todo: lock?
 		_, isleader := rf.GetState()
 		if !isleader {
 			rf.timer_mu.Lock()
