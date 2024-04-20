@@ -144,6 +144,9 @@ func (rf *Raft) GetLastLogIndex() int {
 }
 
 func (rf *Raft) GetLogByIndex(idx int) LogEntry{
+	if (idx < rf.LastSnapshotLogIndex){
+		fmt.Printf("Server %v GetLogByIndex: idx %v < LastSnapshotLogIndex %v\n", rf.me, idx, rf.LastSnapshotLogIndex)
+	}
 	return rf.Log[idx - rf.LastSnapshotLogIndex]
 }
 
@@ -223,6 +226,7 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	DPrintf("server %d start snapshot at index %v", rf.me, index)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if index <= rf.LastSnapshotLogIndex {
@@ -240,10 +244,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.LastSnapshotLogIndex = index
 	rf.SnapshotData = clone(snapshot)
 	// todo: check need it?
+	if (rf.CommitIndex < rf.LastSnapshotLogIndex){
+		rf.CommitIndex = rf.LastSnapshotLogIndex
+	}
 	if (rf.LastApplied < rf.LastSnapshotLogIndex){
 		rf.LastApplied = rf.LastSnapshotLogIndex
 	}
-
+	DPrintf("server %d finish snapshot at index %v, now log is %v", rf.me, index, rf.Log)
 	rf.persist()
 	// w := new(bytes.Buffer)
 	// e := labgob.NewEncoder(w)
@@ -287,11 +294,6 @@ func (rf *Raft) CutLogWithSnapshot(LastIncludedIndex int, LastIncludedTerm int){
 
 func (rf *Raft) write_data_to_applychan(msg ApplyMsg){
 	rf.msg_chan <- msg
-	rf.mu.Lock()
-	if msg.SnapshotIndex > rf.LastApplied{
-		rf.LastApplied = msg.SnapshotIndex
-	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) SendInstallSnapshot(server int){
@@ -305,6 +307,7 @@ func (rf *Raft) SendInstallSnapshot(server int){
 	}
 	reply := InstallSnapshotReply{}
 	rf.mu.Unlock()
+	DPrintf("server %d send InstallSnapshot to %d, args: %v", rf.me, server, args)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 	if ok{
 		rf.mu.Lock()
@@ -324,15 +327,18 @@ func (rf *Raft) SendInstallSnapshot(server int){
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply){
+	DPrintf("server %d receive InstallSnapshot from %d, args: %v", rf.me, args.LeaderId, args)
 	rf.mu.Lock()
 	if rf.UpdateTerm(args.Term) == SmallerTerm{
 		reply.Term = rf.CurrentTerm
+		rf.mu.Unlock()
 		return
 	}
 	reply.Term = rf.CurrentTerm
 	// don't need to reply in fact? but cannot implement...
 	if args.LastIncludedIndex <= rf.LastSnapshotLogIndex{
 		reply.NewSnapLogIndex = rf.LastSnapshotLogIndex
+		rf.mu.Unlock()
 		return
 	}
 	msg := ApplyMsg{
@@ -349,10 +355,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex > rf.CommitIndex{
 		rf.CommitIndex = args.LastIncludedIndex
 	}
+	if args.LastIncludedIndex > rf.LastApplied{
+		rf.LastApplied = args.LastIncludedIndex
+	}
 	reply.NewSnapLogIndex = rf.LastSnapshotLogIndex
 	rf.persist()
 	rf.mu.Unlock()
 	go rf.write_data_to_applychan(msg)
+	DPrintf("server %d finish InstallSnapshot from %d, now log is %v", rf.me, args.LeaderId, rf.Log)
 }
 
 
@@ -476,6 +486,7 @@ type AppendEntriesReply struct {
 	Success bool
 	ConflictIndex int
 	ConflictTerm int
+	// IndexIsInsideSnapshot bool
 }
 
 func init_reply(reply *AppendEntriesReply){
@@ -483,6 +494,7 @@ func init_reply(reply *AppendEntriesReply){
 	reply.Success = false
 	reply.ConflictIndex = 0
 	reply.ConflictTerm = 0
+	// reply.IndexIsInsideSnapshot = false
 }
 
 func (rf *Raft) check_need_send_snapshot(server int) bool{
@@ -498,14 +510,6 @@ func (rf *Raft) sendAppendEntries(server int){
 		}
 		need_send_snapshot := rf.check_need_send_snapshot(server)
 		if (need_send_snapshot){
-			// args := InstallSnapshotArgs{
-			// 	Term: rf.CurrentTerm,
-			// 	LeaderId: rf.me,
-			// 	LastIncludedIndex: rf.LastSnapshotLogIndex,
-			// 	LastIncludedTerm: rf.LastSnapshotLogTerm,
-			// 	data: clone(rf.SnapshotData),
-			// }
-			// reply := InstallSnapshotReply{}
 			rf.mu.Unlock()
 			rf.SendInstallSnapshot(server)
 		} else {
@@ -531,6 +535,7 @@ func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *
 	// 	// DPrintf("server %d sendAppendEntries to %d, args: %v", rf.me, server, args)
 	// }
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	DPrintf("server %d send AppendEntries to %d, args: %v", rf.me, server, args)
 	// only retry when the term is the same and still in leader state
 	for !ok{
 		cterm, isleader := rf.GetState()
@@ -539,13 +544,14 @@ func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *
 		}
 		time.Sleep(time.Duration(RESEND_WHEN_REQLOST_INTERVAL) * time.Millisecond)
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		DPrintf("server %d send AppendEntries to %d inretry, args: %v", rf.me, server, args)
 	}
 	return rf.handleAppendEntriesReply(server, args, reply)
 }
 
 // return false if need to retry
 func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
-	// DPrintf("server %d receive AppendEntriesReply from %d, reply: %v", rf.me, server, reply)
+	DPrintf("server %d receive AppendEntriesReply from %d, args:%v, reply: %v", rf.me, server, args, reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// stop retry if become a follower
@@ -554,9 +560,16 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 		return true
 	}
 	if reply.Success{
-		rf.NextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-		rf.MatchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		// a stale msg, don't need to handle
+		if args.PrevLogIndex + len(args.Entries) > rf.MatchIndex[server] {
+			rf.NextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.MatchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		}
 	} else{
+		// if reply.IndexIsInsideSnapshot{
+		// 	rf.NextIndex[server] = reply.ConflictIndex + 1
+		// 	return false
+		// }
 		if (reply.ConflictTerm == 0){
 			if(reply.ConflictIndex == 0){
 				// rf.NextIndex[server] -= 1 // todo: check need it?
@@ -646,25 +659,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.now_state = Follower
 	}
 	rf.reset_election_timer()
+	// If the previous log index is less than the last snapshot index, then just let the leader start from the lastidx of this server
+	if args.PrevLogIndex < rf.LastSnapshotLogIndex{
+		reply.Term = rf.CurrentTerm
+		reply.Success = false
+		reply.ConflictIndex = rf.GetLastLogIndex() + 1
+		reply.ConflictTerm = 0
+		// reply.IndexIsInsideSnapshot = true
+		return
+	}
 	if args.PrevLogIndex != 0 {
 		if args.PrevLogIndex > rf.GetLastLogIndex(){
 			reply.Term = rf.CurrentTerm
 			reply.Success = false
 			reply.ConflictIndex = rf.GetLastLogIndex() + 1
 			reply.ConflictTerm = 0
+			DPrintf("server %d reject AppendEntries from %d, because PrevLogIndex > LastLogIndex, reply: %v", rf.me, args.LeaderId, reply)
 			return
 		} else if rf.GetLogByIndex(args.PrevLogIndex).Term != args.PrevLogTerm {
 			reply.Term = rf.CurrentTerm
 			reply.Success = false
 			reply.ConflictIndex = args.PrevLogIndex
 			reply.ConflictTerm = rf.GetLogByIndex(args.PrevLogIndex).Term
-			for idx := args.PrevLogIndex - 1; idx >= 0; idx--{
+			for idx := args.PrevLogIndex - 1; idx >= rf.LastSnapshotLogIndex; idx--{
 				if (rf.GetLogByIndex(idx).Term == reply.ConflictTerm){
-					reply.ConflictIndex -= 1
+					reply.ConflictIndex = idx
 				} else {
 					break
 				}
 			}
+			DPrintf("server %d reject AppendEntries from %d, because PrevLogTerm not match, reply: %v", rf.me, args.LeaderId, reply)
 			return
 		}
 	}
@@ -860,6 +884,7 @@ func (rf *Raft) commit_ticker(){
 	for !rf.killed(){
 		rf.mu.Lock()
 		if( rf.CommitIndex > rf.LastApplied){
+			DPrintf("server %d commit_ticker, commitIndex: %d, lastApplied: %d", rf.me, rf.CommitIndex, rf.LastApplied)
 			new_commit_idx := rf.CommitIndex
 			commit_msgs := []ApplyMsg{}
 			for idx := rf.LastApplied + 1; idx <= rf.CommitIndex; idx++ {
