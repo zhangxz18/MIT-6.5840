@@ -72,7 +72,7 @@ const ELECTION_TIMEOUT_MIN int = 300
 const HEARTBEAT_INTERVAL int = 100
 const TICKER_INTERVAL int = 20
 const RESEND_WHEN_LOG_CONFLICT_INTERVAL int = 10
-// const RESEND_WHEN_REQLOST_INTERVAL int = 10
+const RESEND_WHEN_REQLOST_INTERVAL int = 20
 
 type LogEntry struct {
 	Term int
@@ -393,7 +393,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			return ok
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
+		time.Sleep(time.Duration(RESEND_WHEN_REQLOST_INTERVAL) * time.Millisecond)
 		reply.Term = 0
 		reply.VoteGranted = false
 		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
@@ -474,7 +474,7 @@ func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *
 		if args.Term != cterm || !isleader{
 			return true // don't retry
 		}
-		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
+		time.Sleep(time.Duration(RESEND_WHEN_REQLOST_INTERVAL) * time.Millisecond)
 		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}
 	return rf.handleAppendEntriesReply(server, args, reply)
@@ -549,9 +549,9 @@ func (rf *Raft)handleAppendEntriesReply(server int, args *AppendEntriesArgs, rep
 			break
 		}
 	} 
-	if finish_find_new_commit{
-		rf.ApplyMsg2StateMachine()
-	}
+	// if finish_find_new_commit{
+	// 	rf.ApplyMsg2StateMachine()
+	// }
 	return true
 }
 
@@ -638,7 +638,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.CommitIndex = newest_index
 		}
 		// DPrintf("server %d chang commit index: to %v", rf.me, rf.CommitIndex)
-		rf.ApplyMsg2StateMachine()
+		// rf.ApplyMsg2StateMachine()
 	}
 	reply.Term = rf.CurrentTerm
 	reply.Success = true
@@ -780,7 +780,6 @@ func (rf *Raft) start_election() {
 	rf.VotedFor = rf.me
 	rf.got_vote_num = 1
 	rf.persist()
-	rf.mu.Unlock()
 	rf.reset_election_timer()
 	replys := make([]RequestVoteReply, len(rf.peers))
 	args := RequestVoteArgs{
@@ -789,11 +788,41 @@ func (rf *Raft) start_election() {
 		LastLogIndex: rf.GetLogLength() - 1,
 		LastLogTerm: rf.GetLogByIndex(rf.GetLogLength() - 1).Term,
 	}
+	rf.mu.Unlock()
 	for idx := range rf.peers {
 		if idx != rf.me {
 			go rf.sendRequestVote(idx, &args, &replys[idx])
 		}
 	} 
+}
+
+func (rf *Raft) commit_ticker(){
+	for !rf.killed(){
+		rf.mu.Lock()
+		if( rf.CommitIndex > rf.LastApplied){
+			new_commit_idx := rf.CommitIndex
+			commit_msgs := []ApplyMsg{}
+			for idx := rf.LastApplied + 1; idx <= rf.CommitIndex; idx++ {
+				commit_msgs = append(commit_msgs, ApplyMsg{
+					CommandValid: true,
+					Command: rf.GetLogByIndex(idx).Command,
+					CommandIndex: idx,
+				})
+			}
+			rf.mu.Unlock()
+			for _, msg := range commit_msgs{
+				rf.msg_chan <- msg
+			}
+			rf.mu.Lock()
+			if (new_commit_idx > rf.LastApplied){
+				rf.LastApplied = new_commit_idx
+			}
+			rf.mu.Unlock()
+		} else{
+			rf.mu.Unlock()
+		}
+		time.Sleep(time.Duration(TICKER_INTERVAL) * time.Millisecond)
+	}
 }
 
 func (rf *Raft) ticker() {
@@ -870,6 +899,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.commit_ticker()
 
 
 	return rf
