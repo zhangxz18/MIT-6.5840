@@ -394,11 +394,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// // // DPrintf("server %d receive RequestVote from %d, args: %v", rf.me, args.CandidateId, args)
-	// // // DPrintf("server %d now term is %v", rf.me, rf.currentTerm)
+	DPrintf("server %d receive RequestVote from %d, args: %v\nserver %d now term is %v, now_last_log is %v\n", rf.me, args.CandidateId, args, rf.me, rf.CurrentTerm, rf.GetLogByIndex(rf.GetLastLogIndex()))
 	if rf.UpdateTerm(args.Term) == SmallerTerm{
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+		DPrintf("server %d reply RequestVote to %d, reply.term:%v, reply.votegranted:%v. Refuse due to smaller term\n", rf.me, args.CandidateId, reply.Term, reply.VoteGranted)
+
 		return
 	}
 	reply.Term = rf.CurrentTerm
@@ -415,7 +416,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 		reply.VoteGranted = true
 		rf.reset_election_timer()
 	}
-	// // // DPrintf("server %d reply RequestVote to %d, reply.term:%v, reply.votegranted:%v", rf.me, args.CandidateId, reply.Term, reply.VoteGranted)
+	DPrintf("server %d reply RequestVote to %d, reply.term:%v, reply.votegranted:%v", rf.me, args.CandidateId, reply.Term, reply.VoteGranted)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -447,7 +448,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply){
 // the struct itself.
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	// // // DPrintf("server %d send RequestVote to %d, args: %v, now_state: %v", rf.me, server, args, rf.now_state)
+	// DPrintf("server %d send RequestVote to %d, args: %v, now_state: %v", rf.me, server, args, rf.now_state)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	// only retry when the term is the same and still in candidate state
 	for !ok {
@@ -537,7 +538,7 @@ func (rf *Raft) sendAppendEntries(server int){
 // return true if don't need to retry
 func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
 	// if len(args.Entries) > 0 {
-	// 	// // DPrintf("server %d sendAppendEntries to %d, args: %v", rf.me, server, args)
+	// DPrintf("server %d sendAppendEntries to %d, args: %v", rf.me, server, args)
 	// }
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	// DPrintf("server %d send AppendEntries to %d, args: %v", rf.me, server, args)
@@ -650,8 +651,7 @@ func (rf *Raft) ApplyMsg2StateMachine(){
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// DPrintf("server %d receive AppendEntries from %d, args: %v", rf.me, args.LeaderId, args)
-	// DPrintf("server %d now Log is %v", rf.me, rf.Log)
+	// DPrintf("server %d receive AppendEntries from %d, args: %v\nserver  %d now Log is %v", rf.me, args.LeaderId, args, rf.me, rf.Log)
 	msg_term_state := rf.UpdateTerm(args.Term)
 	if msg_term_state == SmallerTerm{
 		reply.Term = rf.CurrentTerm
@@ -726,7 +726,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.CommitIndex = newest_index
 		}
-		// // DPrintf("server %d chang commit index: to %v", rf.me, rf.CommitIndex)
+		// DPrintf("server %d chang commit index: to %v", rf.me, rf.CommitIndex)
 		// rf.ApplyMsg2StateMachine()
 	}
 	reply.Term = rf.CurrentTerm
@@ -848,7 +848,7 @@ func (rf *Raft) killed() bool {
  }
 
 func (rf *Raft) become_leader() {
-	// // DPrintf("server %d become leader of term%v\n", rf.me, rf.CurrentTerm)
+	DPrintf("server %d become leader of term%v\n", rf.me, rf.CurrentTerm)
 	rf.now_state = Leader
 	rf.got_vote_num = 0 // to avoid other rpc goroutine make it leader again
 	rf.NextIndex = make([]int, len(rf.peers))
@@ -862,8 +862,6 @@ func (rf *Raft) become_leader() {
 
 func (rf *Raft) start_election() {
 	rf.mu.Lock()
-	// // // DPrintf("server %d start election at %v", rf.me, time.Now())
-	
 	rf.now_state = Candidate
 	rf.CurrentTerm += 1
 	rf.VotedFor = rf.me
@@ -878,6 +876,7 @@ func (rf *Raft) start_election() {
 		LastLogTerm: rf.GetLogByIndex(rf.GetLastLogIndex()).Term,
 	}
 	rf.mu.Unlock()
+	DPrintf("server %d start election, args: %v\n", rf.me, args)
 	for idx := range rf.peers {
 		if idx != rf.me {
 			go rf.sendRequestVote(idx, &args, &replys[idx])
@@ -926,6 +925,7 @@ func (rf *Raft) ticker() {
 			rf.timer_mu.Lock()
 			if time.Since(rf.election_timeout_start_time) > time.Duration(rf.random_election_timeout) * time.Millisecond {
 				rf.timer_mu.Unlock()
+				DPrintf("server %d start election from state %v\n", rf.me, rf.now_state)
 				rf.start_election()	
 			} else {
 				rf.timer_mu.Unlock()
