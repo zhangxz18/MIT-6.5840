@@ -451,18 +451,21 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	// DPrintf("server %d send RequestVote to %d, args: %v, now_state: %v", rf.me, server, args, rf.now_state)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	// only retry when the term is the same and still in candidate state
-	for !ok {
-		rf.mu.Lock()
-		if args.Term != rf.CurrentTerm || rf.now_state != Candidate{
-			rf.mu.Unlock()
-			return ok
-		}
-		rf.mu.Unlock()
-		time.Sleep(time.Duration(RESEND_WHEN_REQLOST_INTERVAL) * time.Millisecond)
-		reply.Term = 0
-		reply.VoteGranted = false
-		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if !ok{
+		return ok
 	}
+	// for !ok {
+	// 	rf.mu.Lock()
+	// 	if args.Term != rf.CurrentTerm || rf.now_state != Candidate{
+	// 		rf.mu.Unlock()
+	// 		return ok
+	// 	}
+	// 	rf.mu.Unlock()
+	// 	time.Sleep(time.Duration(RESEND_WHEN_REQLOST_INTERVAL) * time.Millisecond)
+	// 	reply.Term = 0
+	// 	reply.VoteGranted = false
+	// 	ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
+	// }
 	// // // DPrintf("server %d receive RequestVoteReply from %d, reply: %v", rf.me, server, reply)
 	rf.mu.Lock()
 	if rf.UpdateTerm(reply.Term) == SameTerm{
@@ -541,17 +544,20 @@ func (rf *Raft) __sendAppendEntries(server int, args *AppendEntriesArgs, reply *
 	// DPrintf("server %d sendAppendEntries to %d, args: %v", rf.me, server, args)
 	// }
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok{
+		return true
+	}
 	// DPrintf("server %d send AppendEntries to %d, args: %v", rf.me, server, args)
 	// only retry when the term is the same and still in leader state
-	for !ok{
-		cterm, isleader := rf.GetState()
-		if args.Term != cterm || !isleader{
-			return true // don't retry
-		}
-		time.Sleep(time.Duration(RESEND_WHEN_REQLOST_INTERVAL) * time.Millisecond)
-		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
-		// DPrintf("server %d send AppendEntries to %d inretry, args: %v", rf.me, server, args)
-	}
+	// for !ok{
+	// 	cterm, isleader := rf.GetState()
+	// 	if args.Term != cterm || !isleader{
+	// 		return true // don't retry
+	// 	}
+	// 	time.Sleep(time.Duration(RESEND_WHEN_REQLOST_INTERVAL) * time.Millisecond)
+	// 	ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	// 	// DPrintf("server %d send AppendEntries to %d inretry, args: %v", rf.me, server, args)
+	// }
 	return rf.handleAppendEntriesReply(server, args, reply)
 }
 
