@@ -1,9 +1,7 @@
 # My solution for MIT 6.5840
 ## result
-### Lab 1
-跑了200次没有fail
-
 ### Lab 2
+![Lab2_test_result](picture/test_result.png)
 
 ## Notes
 ### Lab 1
@@ -23,4 +21,4 @@
     + 原因分析：fail的直接原因是长期选不出leader（选出leader后马上有新的leader替换上来）。更根本的原因是我在实现里对每一个传输失败(Call返回false)的RPC都会不断重传直到重传成功或term改变，这导致了接收端需要花费大量CPU时间处理这些任务。
     + 优化1：减少ticker的唤醒频率，即follower或candidate下一次唤醒时间不应该小于min(timeout_time, now_time + heartbeattimeout)，而不需要用20ms的固定interval。但是这个办法没能解决问题。（实际上有可能小于，例如vote后reset_election_timeout的随机数恰好很小，就可能小于，但影响不大）
     + 优化2：减少commit_ticker的唤醒频率，从固定周期唤醒改成sync.Cond来做。没能解决问题。
-    + 优化3：放弃RPC call fail的重传。解决了（但这似乎不符合文章的要求）。
+    + 优化3：放弃RPC call fail的重传，解决了。因为需要重传的信息迟早会以别的方式到达，因此正确性可以保证；但这似乎不符合文章中“Servers retry RPCs if they do not receive a response in a timely manner”的要求。
