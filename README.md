@@ -1,7 +1,11 @@
-# My solution for MIT 6.5840
-## result
+# My Solution for MIT 6.5840 2023
+课程网站：http://nil.csail.mit.edu/6.5840/2023/schedule.html  
+测试脚本来源：https://gist.github.com/JJGO/0d73540ef7cc2f066cb535156b7cbdab 
+## Result
+### Lab 1
+![Lab1_test_result](picture/lab1_result.png)
 ### Lab 2
-![Lab2_test_result](picture/test_result.png)
+![Lab2_test_result](picture/lab2_result.png)
 
 ## Notes
 ### Lab 1
@@ -18,7 +22,7 @@
 5. bug: 如果AppendEntries里的PrevLogIndex小于LastSnapshotIndex，需要考虑怎么合理地返回参数。一个办法是额外加一个参数，然后让leader直接重传之后的所有Log（但是开销太大了）。实际上，这个prevlogindex过小的请求理论上是过时的（因为snapshot里都是已经commit的），所以可以直接返回LastIndex作为conflict index，让leader重新往回倒，这次必然不会倒到snapshot里面
 6. bug: Lab 2C 即使在优化3和4过后，TestUnreliableChurn2C 依然小概率出现failed to reach agreement（大约1/50的概率)。而且这个现象往往在系统长时间go run test才会出现。
 
-    + 原因分析：fail的直接原因是长期选不出leader（选出leader后马上有新的leader替换上来）。更根本的原因是我在实现里对每一个传输失败(Call返回false)的RPC都会不断重传直到重传成功或term改变，这导致了接收端需要花费大量CPU时间处理这些任务。
+    + 原因分析：fail的直接原因是长期选不出leader（选出leader后马上有新的leader替换上来）。更根本的原因是我在实现里对每一个传输失败(Call返回false)的RPC都会不断重传直到重传成功或term改变，这导致了发送端的未成功的RPC积累，占据大量CPU时间/接收端需要花费大量CPU时间处理自己失联期间的请求。(考虑一个5个server的场景，0是leader，4被partitioned了，这期间失败的RPC请求数量增加，0需要不断重发，等到4 connect回来的时候它需要处理大量这之前的请求，这都要占用大量的CPU时间)
     + 优化1：减少ticker的唤醒频率，即follower或candidate下一次唤醒时间不应该小于min(timeout_time, now_time + heartbeattimeout)，而不需要用20ms的固定interval。但是这个办法没能解决问题。（实际上有可能小于，例如vote后reset_election_timeout的随机数恰好很小，就可能小于，但影响不大）
     + 优化2：减少commit_ticker的唤醒频率，从固定周期唤醒改成sync.Cond来做。没能解决问题。
     + 优化3：放弃RPC call fail的重传，解决了。因为需要重传的信息迟早会以别的方式到达，因此正确性可以保证；但这似乎不符合文章中“Servers retry RPCs if they do not receive a response in a timely manner”的要求。
