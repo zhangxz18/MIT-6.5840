@@ -511,7 +511,7 @@ func (rf *Raft) check_need_send_snapshot(server int) bool{
 }
 
 func (rf *Raft) sendAppendEntries(server int){
-	for{
+	for !rf.killed(){
 		rf.mu.Lock()
 		if rf.now_state != Leader{
 			rf.mu.Unlock()
