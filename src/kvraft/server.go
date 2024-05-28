@@ -64,7 +64,7 @@ type KVServer struct {
 	// Your definitions here.
 	kv_map map[string]string
 	lastOpReuslt map[int64]OpResult
-	chan_map map[int]chan OpResult // chan between rpc handler and applyCh reader
+	chan_map map[int]*chan OpResult // chan between rpc handler and applyCh reader
 }
 
 func (kv *KVServer) IsLastOp(uid UniqueId) OPTIMESTATE{
@@ -117,8 +117,8 @@ func (kv *KVServer) ApplyChReader() {
 					}
 					kv.lastOpReuslt[chan_op.RPCId.ClientId] = op_result
 				}
-				if ch, ok := kv.chan_map[m.CommandIndex]; ok{
-					ch <- op_result
+				if ch_ptr, ok := kv.chan_map[m.CommandIndex]; ok{
+					*ch_ptr <- op_result
 				}
 			}
 		}
@@ -157,9 +157,12 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 		return op_result
 	}
 	// will there be a exsiting chan?
-	kv.chan_map[idx] = make(chan OpResult)
+	mychan := make(chan OpResult)
+	kv.mu.Lock()
+	kv.chan_map[idx] = &mychan
+	kv.mu.Unlock()
 	select {
-		case msg := <-kv.chan_map[idx]:
+		case msg := <-mychan:
 			now_term, is_leader := kv.rf.GetState()
 			if !is_leader || start_term != now_term{
 				// todo:should we check the term?
@@ -174,8 +177,12 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 		// default:
 	}
 	kv.mu.Lock()
-	close(kv.chan_map[idx])
-	delete(kv.chan_map, idx)
+	if chan_ptr, ok := kv.chan_map[idx]; ok{
+		if chan_ptr == &mychan{
+			delete(kv.chan_map, idx)
+		}
+	}
+	close(mychan)
 	kv.mu.Unlock()
 	return op_result
 }
@@ -246,7 +253,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.kv_map = make(map[string]string)
 	kv.lastOpReuslt = make(map[int64]OpResult)
-	kv.chan_map = make(map[int]chan OpResult)
+	kv.chan_map = make(map[int]*chan OpResult)
 	go kv.ApplyChReader()
 
 	return kv
