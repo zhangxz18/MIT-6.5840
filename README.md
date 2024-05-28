@@ -27,3 +27,6 @@
     + 优化2：减少commit_ticker的唤醒频率，从固定周期唤醒改成sync.Cond来做。没能解决问题。
     + 优化3：放弃RPC call fail的重传，解决了。因为需要重传的信息迟早会以别的方式到达，因此正确性可以保证；但这似乎不符合文章中“Servers retry RPCs if they do not receive a response in a timely manner”的要求。
     + **上面不本质。本质原因是我sendAppendEntries的时候直接写了for{}而不是for!killed{}。导致kill之后goroutine还一直存在，占用了大量memory和cpu**。
+### Lab 3
++ 去重：Log重复没有关系，只要ApplyChReader读出来的时候检查一下是否重复，如果重复就不执行就可以。
++ 由于client是单线程的，所以如果server上client 1的request N已经被apply了，那么所有小于N的都已经被apply了（否则client就会处于重传小于N的request状态），因此如果这时候applyChReader从applyCh读出了一个小于N的operation，可以直接不管它。
