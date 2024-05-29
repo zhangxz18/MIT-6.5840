@@ -2,3 +2,7 @@ pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
+mytest/
+mymain/
+launch.json
+2024*

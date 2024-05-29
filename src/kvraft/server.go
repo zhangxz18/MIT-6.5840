@@ -11,7 +11,7 @@ import (
 	"6.5840/raft"
 )
 
-const ApplyTimeOut = 1000 * time.Millisecond
+const ApplyTimeOut = 500 * time.Millisecond
 const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -88,6 +88,7 @@ func (kv *KVServer) ApplyChReader() {
 		op_result := OpResult{Err: OK, Value: "", RPCId: UniqueId{0, 0}}
 		kv.mu.Lock()
 		if m.CommandValid{
+			DPrintf("ApplyChReader:server %d read command %v from applyCh at idx %v", kv.me, m.Command, m.CommandIndex)
 			if chan_op, ok := m.Command.(Op); ok{
 				is_last_op := kv.IsLastOp(chan_op.RPCId)
 				if is_last_op == STALEOP{
@@ -118,7 +119,9 @@ func (kv *KVServer) ApplyChReader() {
 					kv.lastOpReuslt[chan_op.RPCId.ClientId] = op_result
 				}
 				if ch_ptr, ok := kv.chan_map[m.CommandIndex]; ok{
+					DPrintf("ApplyChReader: server %d try to write chan %p in idx %d", kv.me, kv.chan_map[m.CommandIndex], m.CommandIndex)
 					*ch_ptr <- op_result
+					DPrintf("ApplyChReader: server %d finish write chan %p in idx %d", kv.me, kv.chan_map[m.CommandIndex], m.CommandIndex)
 				}
 			}
 		}
@@ -129,37 +132,44 @@ func (kv *KVServer) ApplyChReader() {
 }
 
 func (kv *KVServer) HandleOp(op Op) OpResult{
+	DPrintf("HandleOp: server %d start handle op :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	op_result := OpResult{Err: OK, Value: "", RPCId: op.RPCId}
-	kv.mu.Lock()
-	is_last_op := kv.IsLastOp(op.RPCId)
-	if is_last_op == STALEOP{
-		// staleop 说明client其实已经往下走了，随便回复都可以
-		kv.mu.Unlock()
-		return op_result
-	} else if is_last_op == LASTOP{
-		op_result = kv.lastOpReuslt[op.RPCId.ClientId]
-		kv.mu.Unlock()
-		return op_result
-	}
-	// new op
-	kv.mu.Unlock()
-	
-	
-	// _, rf_is_leader := kv.rf.GetState()
-	// if	!rf_is_leader{
-	// 	op_result.Err = ErrWrongLeader
-	// 	return op_result
-	// }
-	
-	idx, start_term, is_leader := kv.rf.Start(op)
+	DPrintf("HandleOp: server %d start kv.rf.getsate :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	_, is_leader  := kv.rf.GetState()
+	DPrintf("HandleOp: server %d get %v in kv.rf.getsate:{client %d, seq#%d, op%v }", kv.me, is_leader, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+
 	if !is_leader{
 		op_result.Err = ErrWrongLeader
 		return op_result
 	}
-	// will there be a exsiting chan?
-	mychan := make(chan OpResult)
+
+	DPrintf("HandleOp: server %d start get lock before kv.islastop :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	kv.mu.Lock()
+	is_last_op := kv.IsLastOp(op.RPCId)
+	kv.mu.Unlock()
+	DPrintf("HandleOp: server %d get result %v in kv.islastop :{client %d, seq#%d, op%v }", kv.me, is_last_op, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+
+	if is_last_op == STALEOP{
+		// staleop 说明client其实已经往下走了，随便回复都可以
+		return op_result
+	} else if is_last_op == LASTOP{
+		op_result = kv.lastOpReuslt[op.RPCId.ClientId]	
+		return op_result
+	}
+	// new op
+	DPrintf("HandleOp: server %d try to call raft.Start for op :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	idx, start_term, is_leader := kv.rf.Start(op)
+	if !is_leader{
+		op_result.Err = ErrWrongLeader
+		DPrintf("HandleOp: server %d fail when calling raft.Start for op :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+		return op_result
+	}
+	DPrintf("HandleOp: server %d success when calling raft.Start for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
+	// should make a buffered chan to avoid deadlock
+	mychan := make(chan OpResult, 1)
 	kv.mu.Lock()
 	kv.chan_map[idx] = &mychan
+	DPrintf("HandleOp: server %d finish add chan at %p in idx %d", kv.me, kv.chan_map[idx], idx)
 	kv.mu.Unlock()
 	select {
 		case msg := <-mychan:
@@ -168,21 +178,28 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 				// todo:should we check the term?
 				// 实际上，只需要check start_term和apply的term是否一致即可（保证是同一个op），但是原来的代码不太好实现。。。
 				// 不过这里逻辑也是对的，只有在整个处理期间leader和term没改变，才能认为这是一个正常的操作，虽然可能影响效率
+				DPrintf("HandleOp: server %d get msg but term change when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 				op_result.Err = ErrWrongLeader
 			} else{
+				DPrintf("HandleOp: server %d et msg when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 				op_result = msg
 			}
-		case <-time.After(1000 * time.Millisecond):
+		case <-time.After(ApplyTimeOut):
+			DPrintf("HandleOp: server %d timeout when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 			op_result.Err = ErrTimeOut
 		// default:
 	}
+	DPrintf("HandleOp: server %d try to get lock for cleaning for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 	kv.mu.Lock()
 	if chan_ptr, ok := kv.chan_map[idx]; ok{
+		DPrintf("HandleOp: server %d try to delete chan in idx %d", kv.me, idx)
 		if chan_ptr == &mychan{
 			delete(kv.chan_map, idx)
 		}
 	}
+	DPrintf("HandleOp: server %d finish start close chan at %p :{client %d, seq#%d, op%v } in idx %d",  kv.me, &mychan, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 	close(mychan)
+	DPrintf("HandleOp: server %d finish close chan at %p :{client %d, seq#%d, op%v }", kv.me, &mychan, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	kv.mu.Unlock()
 	return op_result
 }
@@ -193,6 +210,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = op_result.Err
 	reply.RPCId = op_result.RPCId
 	reply.Value = op_result.Value
+	DPrintf("server %d get reply: {client %d, seq#%d, op%v, err:%v, value:%s}", kv.me, reply.RPCId.ClientId, reply.RPCId.RequestId, GET, reply.Err, reply.Value)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -203,6 +221,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op_result := kv.HandleOp(operations)
 	reply.Err = op_result.Err
 	reply.RPCId = op_result.RPCId
+	DPrintf("server %d putappend reply: {client %d, seq#%d, op%v, err:%v}", kv.me, reply.RPCId.ClientId, reply.RPCId.RequestId, operations.Type, reply.Err)
 }
 
 // the tester calls Kill() when a KVServer instance won't

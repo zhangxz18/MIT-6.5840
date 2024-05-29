@@ -28,5 +28,21 @@
     + 优化3：放弃RPC call fail的重传，解决了。因为需要重传的信息迟早会以别的方式到达，因此正确性可以保证；但这似乎不符合文章中“Servers retry RPCs if they do not receive a response in a timely manner”的要求。
     + **上面不本质。本质原因是我sendAppendEntries的时候直接写了for{}而不是for!killed{}。导致kill之后goroutine还一直存在，占用了大量memory和cpu**。
 ### Lab 3
-+ 去重：Log重复没有关系，只要ApplyChReader读出来的时候检查一下是否重复，如果重复就不执行就可以。
++ linearizable和去重：使用一个goroutine（ApplyChReader）不断读ApplyCh，并且执行读出来的log，由于执行是单线程的，可以保证linearizable。Log重复没有关系，只要ApplyChReader读出来的时候检查一下是否重复，如果重复就不执行就可以。
 + 由于client是单线程的，所以如果server上client 1的request N已经被apply了，那么所有小于N的都已经被apply了（否则client就会处于重传小于N的request状态），因此如果这时候applyChReader从applyCh读出了一个小于N的operation，可以直接不管它。
++ 使用chan在server的RPC handler和ApplyChReader之间通信。对于每一个Operation，如果server此时是leader且这是当前client上最新的op，handler就会调用raft.Start（）开始append这个Log到raft，并且根据返回的Log Index创建一个chan。之后ApplyChReader从ApplyCh读出一个command时，会将结果写入其index对应的chan中。handler listen这个chan直到有结果，或者超时后返回ErrTimeout。
+    + handler会确保执行结束后和start()开始的时候在同一个term，因此可以通过index唯一标识一个op。 
+    + 这里我的实现如下，之所以使用指针是为了保证handler只会listen自己创建的chan，避免取走别的RPC handler的结果。
+    ```
+    	mychan := make(chan OpResult, 1)
+        kv.mu.Lock()
+        kv.chan_map[idx] = &mychan
+        kv.mu.Unlock()
+    ```
+    + 如果有极小概率在TestManyPartitionsManyClients3A出现死锁的情况（我的实现约1/100），记得将chan开成buffer chan（即`mychan := make(chan OpResult, 1)` )。否则，对于unbuffered channel考虑下面一种时序：
+    ```
+    ApplyChReader lock
+                            RpcHandler timeout(stop listening chan), waitting for lock
+    ApplyChReader try to write chan(block)
+    ```
+    这种情况下ApplyChReader先拿锁，此时RPC handler恰好timeout了，handler想要拿锁去关闭chan，但是需要等ApplyHandler释放锁；ApplyChReader尝试写channel，但是因为RPC handler已经不listen了，写操作被block了，于是就死锁了。

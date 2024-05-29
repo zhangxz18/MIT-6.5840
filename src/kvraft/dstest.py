@@ -102,6 +102,8 @@ def print_results(results: Dict[str, Dict[str, StatsMeter]], timing=False):
 
 def run_test(test: str, race: bool, timing: bool):
     test_cmd = ["go", "test", f"-run={test}"]
+    # test_cmd.append("--timeout")
+    # test_cmd.append("2m")
     if race:
         test_cmd.append("-race")
     if timing:

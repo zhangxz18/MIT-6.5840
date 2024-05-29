@@ -49,6 +49,8 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{Key: key, RPCId: UniqueId{ClientId: ck.client_id, RequestId: ck.next_seq_id}}
 	now_server:= ck.last_leader
 	for (!success_rpc) {
+		DPrintf("client %d start seq#%d request: Get key:%s", ck.client_id, ck.next_seq_id, key)
+
 		reply := GetReply{}
 		now_server = now_server % len(ck.servers);
 		ok := ck.servers[now_server].Call("KVServer.Get", &args, &reply)
@@ -58,8 +60,10 @@ func (ck *Clerk) Get(key string) string {
 				success_rpc = true
 				ck.last_leader = now_server
 				ck.next_seq_id++
+				DPrintf("client %d seq#%d get receive reply {key:%s value:%s}", ck.client_id, ck.next_seq_id,key, reply.Value)
 				return reply.Value
 			} else if (reply.Err == ErrWrongLeader || reply.Err == ErrWrongTerm || reply.Err == ErrTimeOut) {
+				DPrintf("client %d seq#%d get receive reply {key:%s err:%v}", ck.client_id, ck.next_seq_id,key, reply.Err)
 				now_server++
 				continue
 			}
@@ -86,6 +90,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := PutAppendArgs{Key: key, Value: value, Op: op, RPCId: UniqueId{ClientId: ck.client_id, RequestId: ck.next_seq_id}}
 	now_server:= ck.last_leader
 	for (!success_rpc) {
+		DPrintf("client %d start seq#%d request: PutAppend key:%s value:%s op:%s", ck.client_id, ck.next_seq_id, key, value, op)
+
 		reply := PutAppendReply{}
 		now_server = now_server % len(ck.servers);
 		ok := ck.servers[now_server].Call("KVServer.PutAppend", &args, &reply)
@@ -94,8 +100,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				success_rpc = true
 				ck.last_leader = now_server
 				ck.next_seq_id++
+				DPrintf("client %d seq#%d putappend receive reply {key:%s}", ck.client_id, ck.next_seq_id,key)
 				return
 			} else if (reply.Err == ErrWrongLeader || reply.Err == ErrWrongTerm || reply.Err == ErrTimeOut) {
+				DPrintf("client %d seq#%d putappend receive reply {key:%s err:%v}", ck.client_id, ck.next_seq_id,key, reply.Err)
 				now_server++
 				continue
 			}
