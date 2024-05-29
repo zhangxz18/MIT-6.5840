@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -123,7 +125,14 @@ func (kv *KVServer) ApplyChReader() {
 					*ch_ptr <- op_result
 					DPrintf("ApplyChReader: server %d finish write chan %p in idx %d", kv.me, kv.chan_map[m.CommandIndex], m.CommandIndex)
 				}
+				if kv.maxraftstate != -1 && float64(kv.rf.GetPersistSize()) > 0.8 * float64(kv.maxraftstate){
+					snapshot_data := kv.KVMakePersistfunc()
+					kv.rf.Snapshot(m.CommandIndex, snapshot_data)
+				}
 			}
+		} else if m.SnapshotValid{
+			snapshot_data := m.Snapshot
+			kv.KVReadPersist(snapshot_data)
 		}
 		kv.mu.Unlock()
 	}
@@ -243,6 +252,35 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) KVMakePersistfunc () []byte{
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kv_map)
+	e.Encode(kv.lastOpReuslt)
+	kvsnapshot := w.Bytes()
+	return kvsnapshot
+}
+
+
+func (kv *KVServer) KVReadPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// // Your code here (2C).
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvm map[string]string
+	var lor map[int64]OpResult
+	if d.Decode(&kvm) != nil ||
+	   d.Decode(&lor) != nil {
+		fmt.Printf("Decode error\n")
+		return
+	} else {
+		kv.kv_map = kvm
+		kv.lastOpReuslt = lor
+	}
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -273,6 +311,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kv_map = make(map[string]string)
 	kv.lastOpReuslt = make(map[int64]OpResult)
 	kv.chan_map = make(map[int]*chan OpResult)
+
+	snapshot := persister.ReadSnapshot()
+	kv.mu.Lock()
+	kv.KVReadPersist(snapshot)
+	kv.mu.Unlock()
+
 	go kv.ApplyChReader()
 
 	return kv

@@ -122,6 +122,11 @@ type Raft struct {
 	// Lock of currentterm
 }
 
+func (rf *Raft) GetPersistSize() int {
+	// lock in the persister, don't need to lock here
+	return rf.persister.RaftStateSize()
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
