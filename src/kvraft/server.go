@@ -155,16 +155,19 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 	DPrintf("HandleOp: server %d start get lock before kv.islastop :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	kv.mu.Lock()
 	is_last_op := kv.IsLastOp(op.RPCId)
-	kv.mu.Unlock()
 	DPrintf("HandleOp: server %d get result %v in kv.islastop :{client %d, seq#%d, op%v }", kv.me, is_last_op, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 
 	if is_last_op == STALEOP{
 		// staleop 说明client其实已经往下走了，随便回复都可以
+		kv.mu.Unlock()
 		return op_result
 	} else if is_last_op == LASTOP{
+		kv.mu.Unlock()
 		op_result = kv.lastOpReuslt[op.RPCId.ClientId]	
 		return op_result
 	}
+	kv.mu.Unlock()
+
 	// new op
 	DPrintf("HandleOp: server %d try to call raft.Start for op :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	idx, start_term, is_leader := kv.rf.Start(op)
