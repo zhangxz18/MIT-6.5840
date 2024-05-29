@@ -162,8 +162,8 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 		kv.mu.Unlock()
 		return op_result
 	} else if is_last_op == LASTOP{
-		kv.mu.Unlock()
 		op_result = kv.lastOpReuslt[op.RPCId.ClientId]	
+		kv.mu.Unlock()
 		return op_result
 	}
 	kv.mu.Unlock()
