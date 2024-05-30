@@ -14,7 +14,7 @@ import (
 )
 
 const ApplyTimeOut = 500 * time.Millisecond
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -67,6 +67,7 @@ type KVServer struct {
 	kv_map map[string]string
 	lastOpReuslt map[int64]OpResult
 	chan_map map[int]*chan OpResult // chan between rpc handler and applyCh reader
+	last_executed_index int
 }
 
 func (kv *KVServer) IsLastOp(uid UniqueId) OPTIMESTATE{
@@ -91,6 +92,11 @@ func (kv *KVServer) ApplyChReader() {
 		kv.mu.Lock()
 		if m.CommandValid{
 			DPrintf("ApplyChReader:server %d read command %v from applyCh at idx %v", kv.me, m.Command, m.CommandIndex)
+			if m.CommandIndex <= kv.last_executed_index{
+				kv.mu.Unlock()
+				continue
+			}
+			kv.last_executed_index = m.CommandIndex
 			if chan_op, ok := m.Command.(Op); ok{
 				is_last_op := kv.IsLastOp(chan_op.RPCId)
 				if is_last_op == STALEOP{
@@ -120,19 +126,30 @@ func (kv *KVServer) ApplyChReader() {
 					}
 					kv.lastOpReuslt[chan_op.RPCId.ClientId] = op_result
 				}
+				DPrintf("ApplyChReader: server %d now key_maps is %v after operate at idx%v", kv.me, kv.kv_map, m.CommandIndex)
 				if ch_ptr, ok := kv.chan_map[m.CommandIndex]; ok{
 					DPrintf("ApplyChReader: server %d try to write chan %p in idx %d", kv.me, kv.chan_map[m.CommandIndex], m.CommandIndex)
 					*ch_ptr <- op_result
 					DPrintf("ApplyChReader: server %d finish write chan %p in idx %d", kv.me, kv.chan_map[m.CommandIndex], m.CommandIndex)
 				}
 				if kv.maxraftstate != -1 && float64(kv.rf.GetPersistSize()) > 0.8 * float64(kv.maxraftstate){
+					DPrintf("ApplyChReader: server %d start snapshot at idx %d", kv.me, m.CommandIndex)
 					snapshot_data := kv.KVMakePersistfunc()
 					kv.rf.Snapshot(m.CommandIndex, snapshot_data)
+					DPrintf("ApplyChReader: server %d finish snapshot at idx %d", kv.me, m.CommandIndex)
 				}
 			}
 		} else if m.SnapshotValid{
+			DPrintf("ApplyChReader: server %d read snapshot from applyCh at snapshot idx %d", kv.me, m.SnapshotIndex)
+			if kv.last_executed_index >= m.SnapshotIndex{
+				kv.mu.Unlock()
+				continue
+			}
+			// don't need to update last_executed_index here, because raft doesn't apply a log with smaller index
 			snapshot_data := m.Snapshot
 			kv.KVReadPersist(snapshot_data)
+			DPrintf("ApplyChReader: server %d finish read snapshot from applyCh at snapshot idx %d", kv.me, m.SnapshotIndex)
+			DPrintf("ApplyChReader: server %d now key_maps is %v after snapshot at idx%v", kv.me, kv.kv_map, m.SnapshotIndex)
 		}
 		kv.mu.Unlock()
 	}
@@ -143,19 +160,19 @@ func (kv *KVServer) ApplyChReader() {
 func (kv *KVServer) HandleOp(op Op) OpResult{
 	DPrintf("HandleOp: server %d start handle op :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	op_result := OpResult{Err: OK, Value: "", RPCId: op.RPCId}
-	DPrintf("HandleOp: server %d start kv.rf.getsate :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	// DPrintf("HandleOp: server %d start kv.rf.getsate :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	_, is_leader  := kv.rf.GetState()
-	DPrintf("HandleOp: server %d get %v in kv.rf.getsate:{client %d, seq#%d, op%v }", kv.me, is_leader, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	// DPrintf("HandleOp: server %d get %v in kv.rf.getsate:{client %d, seq#%d, op%v }", kv.me, is_leader, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 
 	if !is_leader{
 		op_result.Err = ErrWrongLeader
 		return op_result
 	}
 
-	DPrintf("HandleOp: server %d start get lock before kv.islastop :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	// DPrintf("HandleOp: server %d start get lock before kv.islastop :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	kv.mu.Lock()
 	is_last_op := kv.IsLastOp(op.RPCId)
-	DPrintf("HandleOp: server %d get result %v in kv.islastop :{client %d, seq#%d, op%v }", kv.me, is_last_op, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	// DPrintf("HandleOp: server %d get result %v in kv.islastop :{client %d, seq#%d, op%v }", kv.me, is_last_op, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 
 	if is_last_op == STALEOP{
 		// staleop 说明client其实已经往下走了，随便回复都可以
@@ -169,7 +186,7 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 	kv.mu.Unlock()
 
 	// new op
-	DPrintf("HandleOp: server %d try to call raft.Start for op :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	// DPrintf("HandleOp: server %d try to call raft.Start for op :{client %d, seq#%d, op%v }", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	idx, start_term, is_leader := kv.rf.Start(op)
 	if !is_leader{
 		op_result.Err = ErrWrongLeader
@@ -181,7 +198,7 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 	mychan := make(chan OpResult, 1)
 	kv.mu.Lock()
 	kv.chan_map[idx] = &mychan
-	DPrintf("HandleOp: server %d finish add chan at %p in idx %d", kv.me, kv.chan_map[idx], idx)
+	// DPrintf("HandleOp: server %d finish add chan at %p in idx %d", kv.me, kv.chan_map[idx], idx)
 	kv.mu.Unlock()
 	select {
 		case msg := <-mychan:
@@ -193,25 +210,25 @@ func (kv *KVServer) HandleOp(op Op) OpResult{
 				DPrintf("HandleOp: server %d get msg but term change when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 				op_result.Err = ErrWrongLeader
 			} else{
-				DPrintf("HandleOp: server %d et msg when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
+				// DPrintf("HandleOp: server %d et msg when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 				op_result = msg
 			}
 		case <-time.After(ApplyTimeOut):
-			DPrintf("HandleOp: server %d timeout when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
+			// DPrintf("HandleOp: server %d timeout when waiting for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 			op_result.Err = ErrTimeOut
 		// default:
 	}
-	DPrintf("HandleOp: server %d try to get lock for cleaning for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
+	// DPrintf("HandleOp: server %d try to get lock for cleaning for op :{client %d, seq#%d, op%v } in idx %d", kv.me, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 	kv.mu.Lock()
 	if chan_ptr, ok := kv.chan_map[idx]; ok{
-		DPrintf("HandleOp: server %d try to delete chan in idx %d", kv.me, idx)
+		// DPrintf("HandleOp: server %d try to delete chan in idx %d", kv.me, idx)
 		if chan_ptr == &mychan{
 			delete(kv.chan_map, idx)
 		}
 	}
-	DPrintf("HandleOp: server %d finish start close chan at %p :{client %d, seq#%d, op%v } in idx %d",  kv.me, &mychan, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
+	// DPrintf("HandleOp: server %d finish start close chan at %p :{client %d, seq#%d, op%v } in idx %d",  kv.me, &mychan, op.RPCId.ClientId, op.RPCId.RequestId, op.Type, idx)
 	close(mychan)
-	DPrintf("HandleOp: server %d finish close chan at %p :{client %d, seq#%d, op%v }", kv.me, &mychan, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
+	// DPrintf("HandleOp: server %d finish close chan at %p :{client %d, seq#%d, op%v }", kv.me, &mychan, op.RPCId.ClientId, op.RPCId.RequestId, op.Type)
 	kv.mu.Unlock()
 	return op_result
 }
@@ -222,7 +239,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = op_result.Err
 	reply.RPCId = op_result.RPCId
 	reply.Value = op_result.Value
-	DPrintf("server %d get reply: {client %d, seq#%d, op%v, err:%v, value:%s}", kv.me, reply.RPCId.ClientId, reply.RPCId.RequestId, GET, reply.Err, reply.Value)
+	DPrintf("Get:server %d get reply: {client %d, seq#%d, op%v, err:%v, key:%s, value:%s}", kv.me, reply.RPCId.ClientId, reply.RPCId.RequestId, GET, reply.Err, args.Key, reply.Value)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -233,7 +250,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op_result := kv.HandleOp(operations)
 	reply.Err = op_result.Err
 	reply.RPCId = op_result.RPCId
-	DPrintf("server %d putappend reply: {client %d, seq#%d, op%v, err:%v}", kv.me, reply.RPCId.ClientId, reply.RPCId.RequestId, operations.Type, reply.Err)
+	DPrintf("PutAppend: server %d putappend reply: {client %d, seq#%d, op%v, err:%v}", kv.me, reply.RPCId.ClientId, reply.RPCId.RequestId, operations.Type, reply.Err)
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -260,6 +277,7 @@ func (kv *KVServer) KVMakePersistfunc () []byte{
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.kv_map)
 	e.Encode(kv.lastOpReuslt)
+	// e.Encode(kv.last_executed_index)
 	kvsnapshot := w.Bytes()
 	return kvsnapshot
 }
@@ -274,13 +292,14 @@ func (kv *KVServer) KVReadPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var kvm map[string]string
 	var lor map[int64]OpResult
-	if d.Decode(&kvm) != nil ||
-	   d.Decode(&lor) != nil {
+	// var lei int
+	if d.Decode(&kvm) != nil || d.Decode(&lor) != nil /*|| d.Decode(&lei) != nil*/{
 		fmt.Printf("Decode error\n")
 		return
 	} else {
 		kv.kv_map = kvm
 		kv.lastOpReuslt = lor
+		// kv.last_executed_index = lei
 	}
 }
 
@@ -314,6 +333,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kv_map = make(map[string]string)
 	kv.lastOpReuslt = make(map[int64]OpResult)
 	kv.chan_map = make(map[int]*chan OpResult)
+	kv.last_executed_index = -1
 
 	snapshot := persister.ReadSnapshot()
 	kv.mu.Lock()

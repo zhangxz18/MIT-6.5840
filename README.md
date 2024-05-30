@@ -46,3 +46,4 @@
     ApplyChReader try to write chan(block)
     ```
     这种情况下ApplyChReader先拿锁，此时RPC handler恰好timeout了，handler想要拿锁去关闭chan，但是需要等ApplyHandler释放锁；ApplyChReader尝试写channel，但是因为RPC handler已经不listen了，写操作被block了，于是就死锁了。
++ snapshot考虑如下时序:server 1的ApplyChReader已经执行了index为1、2、3的op，然后这时候来了一个snapshotindex为2的installSnapshot，如果server 1直接把kv换成新的snapshot对应的kv就会出bug（op3就被覆盖了），所以需要记录snapshot最后执行的日志index。同时，这个参数不需要持久化(尽管我实现的时候还是持久化了)，因为raft天然保证applyCh里的log index大于之前install的snapshot。它唯一的作用是防止install一个过小的snapshot，而重启后server和raft存储的数据是一致的，raft如果installSnapshot就说明这是一个新的操作。（虽然理论上持久化也不会出错）
