@@ -14,8 +14,7 @@ import (
 )
 
 const ApplyTimeOut = 500 * time.Millisecond
-const Debug = true
-
+const Debug = false
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
 		log.Printf(format, a...)
@@ -148,6 +147,7 @@ func (kv *KVServer) ApplyChReader() {
 			// don't need to update last_executed_index here, because raft doesn't apply a log with smaller index
 			snapshot_data := m.Snapshot
 			kv.KVReadPersist(snapshot_data)
+			kv.last_executed_index = m.SnapshotIndex
 			DPrintf("ApplyChReader: server %d finish read snapshot from applyCh at snapshot idx %d", kv.me, m.SnapshotIndex)
 			DPrintf("ApplyChReader: server %d now key_maps is %v after snapshot at idx%v", kv.me, kv.kv_map, m.SnapshotIndex)
 		}
@@ -277,7 +277,7 @@ func (kv *KVServer) KVMakePersistfunc () []byte{
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.kv_map)
 	e.Encode(kv.lastOpReuslt)
-	// e.Encode(kv.last_executed_index)
+	e.Encode(kv.last_executed_index)
 	kvsnapshot := w.Bytes()
 	return kvsnapshot
 }
@@ -292,14 +292,14 @@ func (kv *KVServer) KVReadPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var kvm map[string]string
 	var lor map[int64]OpResult
-	// var lei int
-	if d.Decode(&kvm) != nil || d.Decode(&lor) != nil /*|| d.Decode(&lei) != nil*/{
+	var lei int
+	if d.Decode(&kvm) != nil || d.Decode(&lor) != nil || d.Decode(&lei) != nil{
 		fmt.Printf("Decode error\n")
 		return
 	} else {
 		kv.kv_map = kvm
 		kv.lastOpReuslt = lor
-		// kv.last_executed_index = lei
+		kv.last_executed_index = lei
 	}
 }
 

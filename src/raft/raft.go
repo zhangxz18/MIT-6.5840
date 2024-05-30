@@ -118,7 +118,7 @@ type Raft struct {
 	random_heartbeat_timeout int
 	got_vote_num int 
 	msg_chan chan ApplyMsg
-	installing_snapshot bool
+	installing_snapshot int
 	// Lock of currentterm
 }
 
@@ -232,7 +232,7 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	// DPrintf("server %d start snapshot at index %v", rf.me, index)
+	DPrintf("Snapshot: server %d start snapshot at index %v, lastsnapshotindex:%d, commit_index:%d, lastappliedindex:%d", rf.me, index, rf.LastSnapshotLogIndex, rf.CommitIndex, rf.LastApplied)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if index <= rf.LastSnapshotLogIndex {
@@ -256,16 +256,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if (rf.LastApplied < rf.LastSnapshotLogIndex){
 		rf.LastApplied = rf.LastSnapshotLogIndex
 	}
-	// DPrintf("server %d finish snapshot at index %v, now log is %v", rf.me, index, rf.Log)
+	DPrintf("Snapshot: server %d finish snapshot at index %v, now lastsnapshotindex:%d, commit_index:%d, lastappliedindex:%d", rf.me, index, rf.LastSnapshotLogIndex, rf.CommitIndex, rf.LastApplied)
 	rf.persist()
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.LastSnapshotLogIndex)
-	// e.Encode(rf.GetLogByIndex(index))
-	// snapshot_data := w.Bytes()
-	// rf.LastSnapshotLogIndex = index
-	// rf.LastSnapshotLogTerm = rf.GetLogByIndex(index).Term
-	// rf.SnapshotData = clone(snapshot_data)
 }
 
 type InstallSnapshotArgs struct{
@@ -304,7 +296,8 @@ func (rf *Raft) write_data_to_applychan(msg ApplyMsg){
 	if msg.SnapshotIndex > rf.LastApplied{
 		rf.LastApplied = msg.SnapshotIndex
 	}
-	rf.installing_snapshot = false
+	DPrintf("write_data_to_applychan: server %d write data to applychan, snapshotidx:%d, lastapplied: %d", rf.me, msg.SnapshotIndex, rf.LastApplied)
+	rf.installing_snapshot -= 1
 	rf.mu.Unlock()
 }
 
@@ -339,7 +332,7 @@ func (rf *Raft) SendInstallSnapshot(server int){
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply){
-	// DPrintf("server %d receive InstallSnapshot from %d, args: %v", rf.me, args.LeaderId, args)
+	DPrintf("InstallSnapshot: server %d receive InstallSnapshot from %d, lastsnapshotindex:%d, commit_index:%d, lastappliedindex:%d", rf.me, args.LeaderId, rf.LastSnapshotLogIndex, rf.CommitIndex, rf.LastApplied)
 	rf.mu.Lock()
 	if rf.UpdateTerm(args.Term) == SmallerTerm{
 		reply.Term = rf.CurrentTerm
@@ -360,7 +353,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm: args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
-	rf.installing_snapshot = true
+	rf.installing_snapshot += 1
 	rf.CutLogWithSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
 	rf.SnapshotData = clone(args.Data)
 	rf.LastSnapshotLogTerm = args.LastIncludedTerm
@@ -370,9 +363,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	reply.NewSnapLogIndex = rf.LastSnapshotLogIndex
 	rf.persist()
+	DPrintf("InstallSnapshot: server%d finish installsnapshot from %d, lastsnapshotindex:%d, commit_index:%d, lastappliedindex:%d", rf.me, args.LeaderId, rf.LastSnapshotLogIndex, rf.CommitIndex, rf.LastApplied)
 	rf.mu.Unlock()
 	go rf.write_data_to_applychan(msg)
-	// DPrintf("server %d finish InstallSnapshot from %d, now log is %v", rf.me, args.LeaderId, rf.Log)
+
 }
 
 
@@ -898,8 +892,8 @@ func (rf *Raft) start_election() {
 func (rf *Raft) commit_ticker(){
 	for !rf.killed(){
 		rf.mu.Lock()
-		if( rf.CommitIndex > rf.LastApplied && !rf.installing_snapshot){
-			// DPrintf("server %d commit_ticker, commitIndex: %d, lastApplied: %d", rf.me, rf.CommitIndex, rf.LastApplied)
+		if( rf.CommitIndex > rf.LastApplied && rf.installing_snapshot == 0){
+			DPrintf("commit_ticker:server %d  commitIndex: %d, lastApplied: %d, snapshot idx:%d", rf.me, rf.CommitIndex, rf.LastApplied, rf.LastSnapshotLogIndex)
 			new_commit_idx := rf.CommitIndex
 			commit_msgs := []ApplyMsg{}
 			for idx := rf.LastApplied + 1; idx <= rf.CommitIndex; idx++ {
@@ -992,11 +986,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.reset_election_timer()
 	rf.reset_heartbeat_timer()
 	rf.msg_chan = applyCh
-	rf.installing_snapshot = false
+	rf.installing_snapshot = 0
 
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	DPrintf("Make: server %d start, term: %d, votedfor: %d, log: %v, lastsnapshotindex:%d, commit_index:%d, lastappliedindex:%d", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log, rf.LastSnapshotLogIndex, rf.CommitIndex, rf.LastApplied)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
