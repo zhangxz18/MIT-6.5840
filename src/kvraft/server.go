@@ -50,7 +50,6 @@ type OpResult struct {
 	Err Err
 	Value string
 	RPCId UniqueId
-	Term int
 }
 
 type KVServer struct {
