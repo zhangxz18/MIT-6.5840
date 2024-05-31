@@ -3,6 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"time"
 
 	"6.5840/labrpc"
 )
@@ -65,13 +66,13 @@ func (ck *Clerk) Get(key string) string {
 			} else if (reply.Err == ErrWrongLeader || reply.Err == ErrWrongTerm || reply.Err == ErrTimeOut) {
 				DPrintf("client %d seq#%d get receive reply {key:%s err:%v}", ck.client_id, ck.next_seq_id,key, reply.Err)
 				now_server++
-				continue
 			}
 		} else {
 			// rpc failed
 			now_server++
-			continue
 		}
+		time.Sleep(100 * time.Millisecond)
+
 	}
 	return ""
 }
@@ -105,13 +106,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			} else if (reply.Err == ErrWrongLeader || reply.Err == ErrWrongTerm || reply.Err == ErrTimeOut) {
 				DPrintf("client %d seq#%d putappend receive reply {key:%s err:%v}", ck.client_id, ck.next_seq_id,key, reply.Err)
 				now_server++
-				continue
 			}
 		} else {
 			// rpc failed
 			now_server++
-			continue
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
