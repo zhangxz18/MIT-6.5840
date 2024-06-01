@@ -78,7 +78,10 @@ func (sc *ShardCtrler) IsLastOp(uid UniqueId) OPTIMESTATE{
 
 func CopyConfig(src_config Config, dst_config *Config){
 	dst_config.Num = src_config.Num
-	dst_config.Shards = src_config.Shards
+	dst_config.Shards = [NShards]int{}
+	for i := 0; i < NShards; i++{
+		dst_config.Shards[i] = src_config.Shards[i]
+	}
 	dst_config.Groups = make(map[int][]string)
 	for key, value := range src_config.Groups{
 		dst_config.Groups[key] = value
