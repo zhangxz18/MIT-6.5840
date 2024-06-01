@@ -3,6 +3,7 @@ package shardctrler
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,13 @@ import (
 )
 
 const ApplyTimeOut = 500 * time.Millisecond
+const Debug = false
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
 const INVALID_GID = 0
 type ShardCtrler struct {
 	mu      sync.Mutex
@@ -34,8 +42,12 @@ type ShardCtrler struct {
 type Op struct {
 	// Your data here.
 	Type string
-	Args interface{}
 	RPCId UniqueId
+	Servers map[int][]string // join
+	GIDs []int // leave
+	Shard int // move
+	GID int // move
+	Num int // query
 }
 
 type OPTIMESTATE int
@@ -80,14 +92,13 @@ func (sc *ShardCtrler)Rebalance (op_type string, changed_gid_list []int) [NShard
 	// initialize
 	gid2shards := make(map[int][]int)
 	gid2shards[INVALID_GID] = []int{}
+	for gid := range now_config.Groups{
+		gid2shards[gid] = []int{}
+	}
 	// old gid2shards
 	for i := 0; i < NShards; i++{
 		gid := now_config.Shards[i]
-		if gidlist, ok := gid2shards[gid]; ok{
-			gid2shards[gid] = append(gidlist, i)
-		} else{
-			gid2shards[gid] = []int{i}
-		}
+		gid2shards[gid] = append(gid2shards[gid], i)
 	}
 	// remove or add gid
 	if op_type == "Join"{
@@ -100,7 +111,17 @@ func (sc *ShardCtrler)Rebalance (op_type string, changed_gid_list []int) [NShard
 			delete(gid2shards, changed_gid_list[i])
 		}
 	}
-
+	DPrintf("Rebalance: op_type:%v, gid2shards:%v", op_type, gid2shards)
+	gids_list := []int{}
+	for gid := range gid2shards{
+		gids_list = append(gids_list, gid)
+	}
+	if len(gids_list) == 1 && gids_list[0] == INVALID_GID{
+		for i := 0; i < NShards; i++{
+			new_shards2_gid[i] = INVALID_GID
+		}
+		return new_shards2_gid
+	}
 	// rebalance: find max and min. First, move shard from gid 0 to min_gid; then move shard from max_gid to min_gid. until max_gid - min_gid <= 1
 	// 比较大小：优先比较shard数量，shard数量相同的情况下，比较gid，gid大就大
 	for {
@@ -121,15 +142,16 @@ func (sc *ShardCtrler)Rebalance (op_type string, changed_gid_list []int) [NShard
 				max_gid = gid
 			}
 		}
-		if min_gid == -1 || max_gid == -1{
-			fmt.Printf("Rebalance error\n")
-		}
+		DPrintf("Rebalance: min_gid:%v, max_gid:%v", min_gid, max_gid)
+		// if min_gid == -1 || max_gid == -1{
+		// 	fmt.Printf("Rebalance error\n")
+		// }
 		// todo: should we check there are no valid gid? but it means the system is broken...
 		if len(gid2shards[INVALID_GID]) > 0{
 			shard_to_move := gid2shards[INVALID_GID][0]
 			gid2shards[min_gid] = append(gid2shards[min_gid], shard_to_move)
 			gid2shards[INVALID_GID] = gid2shards[INVALID_GID][1:]
-		} else if max_gid - min_gid > 1{
+		} else if max_gid_shards - min_gid_shrads > 1{
 			shard_to_move := gid2shards[max_gid][0]
 			gid2shards[min_gid] = append(gid2shards[min_gid], shard_to_move)
 			gid2shards[max_gid] = gid2shards[max_gid][1:]
@@ -150,9 +172,9 @@ func (sc *ShardCtrler)Rebalance (op_type string, changed_gid_list []int) [NShard
 func (sc *ShardCtrler) ExecuteOp(op Op, result *OpResult){
 	switch op.Type{
 	case "Join":
-		args := op.Args.(JoinArgs)
+		DPrintf("ExecuteOp: start Join  %v, old_shards2gid:%v, added_gid:%v", op.RPCId, sc.configs[len(sc.configs) - 1].Shards, op.Servers)
 		add_list := []int{}
-		for gid := range args.Servers{
+		for gid := range op.Servers{
 			add_list = append(add_list, gid)
 		}
 		new_shards2gid := sc.Rebalance("Join", add_list)
@@ -160,38 +182,43 @@ func (sc *ShardCtrler) ExecuteOp(op Op, result *OpResult){
 		CopyConfig(sc.configs[len(sc.configs) - 1], &new_config)
 		new_config.Num = len(sc.configs)
 		new_config.Shards = new_shards2gid
-		for gid := range args.Servers{
-			new_config.Groups[gid] = args.Servers[gid]
+		for gid := range op.Servers{
+			new_config.Groups[gid] = op.Servers[gid]
 		}
 		sc.configs = append(sc.configs, new_config)
 		result.Err = OK
+		DPrintf("ExecuteOp: end Join %v,  new_shards2gid:%v", op.RPCId, sc.configs[len(sc.configs) - 1].Shards)
+
 	case "Leave":
-		args := op.Args.(LeaveArgs)
-		new_shards2gid := sc.Rebalance("Leave", args.GIDs)
+		DPrintf("ExecuteOp: start Leave %v, old_shards2gid:%v, removed_gid:%v", op.RPCId, sc.configs[len(sc.configs) - 1].Shards, op.GIDs)
+		new_shards2gid := sc.Rebalance("Leave", op.GIDs)
 		new_config := Config{}
 		CopyConfig(sc.configs[len(sc.configs) - 1], &new_config)
 		new_config.Num = len(sc.configs)
 		new_config.Shards = new_shards2gid
-		for i := 0; i < len(args.GIDs); i++{
-			delete(new_config.Groups, args.GIDs[i])
+		for i := 0; i < len(op.GIDs); i++{
+			delete(new_config.Groups, op.GIDs[i])
 		}
+		sc.configs = append(sc.configs, new_config)
 		result.Err = OK
+		DPrintf("ExecuteOp: end Leave %v, new_shards2gid:%v", op.RPCId, sc.configs[len(sc.configs) - 1].Shards)
 	case "Move":
-		args := op.Args.(MoveArgs)
+		DPrintf("ExecuteOp: start Move %v, old_shards2gid:%v, shard:%v, gid:%v", op.RPCId, sc.configs[len(sc.configs) - 1].Shards, op.Shard, op.GID)
 		old_config := sc.configs[len(sc.configs) - 1]
 		new_config := Config{}
 		CopyConfig(old_config, &new_config)
 		new_config.Num = len(sc.configs)
-		new_config.Shards[args.Shard] = args.GID
+		new_config.Shards[op.Shard] = op.GID
+		sc.configs = append(sc.configs, new_config)
 		result.Err = OK
+		DPrintf("ExecuteOp: end Move %v, new_shards2gid:%v", op.RPCId, sc.configs[len(sc.configs) - 1].Shards)
 	case "Query":
-		args := op.Args.(QueryArgs)
-		if args.Num == -1 || args.Num >= len(sc.configs){
+		if op.Num == -1 || op.Num >= len(sc.configs){
 			CopyConfig(sc.configs[len(sc.configs) - 1], &result.Config)
-		} else if args.Num >= 0 && args.Num < len(sc.configs){
-			CopyConfig(sc.configs[args.Num], &result.Config)
+		} else if op.Num >= 0 && op.Num < len(sc.configs){
+			CopyConfig(sc.configs[op.Num], &result.Config)
 		} else {
-			fmt.Printf("Query config index %d out of bound\n", args.Num)
+			fmt.Printf("Query config index %d out of bound\n", op.Num)
 		}
 		result.Err = OK
 	}
@@ -305,7 +332,11 @@ func (sc *ShardCtrler) HandleOp(op Op) OpResult{
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
-	op := Op{Type: "Join", Args: *args, RPCId: args.RPCId}
+	op := Op{Type: "Join", RPCId: args.RPCId}
+	op.Servers = make(map[int][]string)
+	for key, value := range args.Servers{
+		op.Servers[key] = value
+	}
 	op_result := sc.HandleOp(op)
 	reply.Err = op_result.Err
 	reply.WrongLeader = reply.Err == ErrWrongLeader
@@ -313,7 +344,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
-	op := Op{Type: "Leave", Args: *args, RPCId: args.RPCId}
+	op := Op{Type: "Leave", RPCId: args.RPCId, GIDs: args.GIDs}
 	op_result := sc.HandleOp(op)
 	reply.Err = op_result.Err
 	reply.WrongLeader = reply.Err == ErrWrongLeader
@@ -321,14 +352,14 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
-	op := Op{Type: "Move", Args: *args, RPCId: args.RPCId}
+	op := Op{Type: "Move", RPCId: args.RPCId, Shard: args.Shard, GID: args.GID}
 	op_result := sc.HandleOp(op)
 	reply.Err = op_result.Err
 	reply.WrongLeader = reply.Err == ErrWrongLeader
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	op := Op{Type: "Query", Args: *args, RPCId: args.RPCId}
+	op := Op{Type: "Query", RPCId: args.RPCId, Num: args.Num}
 	op_result := sc.HandleOp(op)
 	reply.Err = op_result.Err
 	reply.Config = op_result.Config
