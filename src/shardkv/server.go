@@ -86,7 +86,6 @@ type ShardData struct {
 }
 
 type AddShardArgs struct {
-	ConfigNum int
 	ShardDataToAdd []ShardData
 	RPCId UniqueId
 }
@@ -285,6 +284,7 @@ func (kv *ShardKV) ApplyChReader() {
 							// todo: garbage collection
 							kv.shard_data[shard_idx].ShardState = NOTOWNED
 						}
+						DPrintf("[group %v server %v]:ApplyChReader handle RemoveShard %v finished, result is %v\n", kv.gid, kv.me, chan_op.RemoveShardList, op_result.Err)
 					}
 				}
 				if ch_ptr, ok := kv.chan_map[m.CommandIndex]; ok{
@@ -409,6 +409,8 @@ func (kv *ShardKV) KVMakePersistfunc () []byte{
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.shard_data)
 	e.Encode(kv.last_executed_index)
+	e.Encode(kv.prev_config)
+	e.Encode(kv.cur_config)
 	kvsnapshot := w.Bytes()
 	return kvsnapshot
 }
@@ -423,12 +425,16 @@ func (kv *ShardKV) KVReadPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var sd []ShardData
 	var lei int
-	if d.Decode(&sd) != nil  || d.Decode(&lei) != nil{
+	var pc shardctrler.Config
+	var cc shardctrler.Config
+	if d.Decode(&sd) != nil  || d.Decode(&lei) != nil || d.Decode(&pc) != nil || d.Decode(&cc) != nil{
 		fmt.Printf("Decode error\n")
 		return
 	} else {
 		kv.shard_data = sd
 		kv.last_executed_index = lei
+		kv.prev_config = pc
+		kv.cur_config = cc
 	}
 }
 
@@ -441,13 +447,14 @@ func (kv *ShardKV) HandleConfigurationChange(op Op) OpResult{
 	// 	return
 	// }
 	// todo: just start it, let applyCh to check the config_num?
+	kv.mu.Lock()
 	idx, _, is_leader := kv.rf.Start(op)
 	if !is_leader{
+		kv.mu.Unlock()
 		op_result.Err = ErrWrongLeader
 		return op_result
 	}
 	mychan := make(chan OpResult, 1)
-	kv.mu.Lock()
 	kv.chan_map[idx] = &mychan
 	kv.mu.Unlock()
 	select {
@@ -470,10 +477,13 @@ func (kv *ShardKV) HandleConfigurationChange(op Op) OpResult{
 func (kv *ShardKV) RemoveShardTicker(shards []int, config_num int){
 	var op Op
 	op.Type = RemoveSHARD
+	op.RemoveShardList = make([]int, len(shards))
 	copy(op.RemoveShardList, shards)
 	op.RPCId = UniqueId{int64(kv.gid), config_num}
+	DPrintf("[group %v server %v]:RemoveShardTicker %v starts for config %v\n", kv.gid, kv.me, shards, config_num)
 	for !kv.killed(){
 		result := kv.HandleConfigurationChange(op)
+		DPrintf("[group %v server %v]:RemoveShardTicker %v for %v end, result %v\n", kv.gid, kv.me, shards, config_num,result.Err)
 		if result.Err == OK || result.Err == ErrConfigFinished{
 			return
 		}
@@ -484,13 +494,13 @@ func (kv *ShardKV) RemoveShardTicker(shards []int, config_num int){
 func (kv *ShardKV) sendAddShard(gid int, shards []int, config_num int){
 	kv.mu.Lock()
 	var args  AddShardArgs
-	args.ConfigNum = config_num
 	args.ShardDataToAdd = make([]ShardData, len(shards))
 	for i := 0; i < len(shards); i++{
 		CloneShardData(&kv.shard_data[shards[i]], &args.ShardDataToAdd[i])
 	}
-	args.RPCId = UniqueId{int64(kv.gid), int(kv.cur_config.Num)}
+	args.RPCId = UniqueId{int64(kv.gid), config_num}
 	kv.mu.Unlock()
+	DPrintf("[group %v server %v]:sendAddShard %v to group %v\n", kv.gid, kv.me, shards, gid)
 	// todo:如果接收方一直没收到这个shard，就永远卡在这了？好像也合理
 	for !kv.killed(){
 		if servers, ok := kv.cur_config.Groups[gid]; ok{
@@ -499,6 +509,7 @@ func (kv *ShardKV) sendAddShard(gid int, shards []int, config_num int){
 				var reply AddShardReply
 				ok := srv.Call("ShardKV.AddShard", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrConfigFinished){
+					DPrintf("[group %v server %v]:sendAddShard %v to group %v success\n", kv.gid, kv.me, shards, gid)
 					go kv.RemoveShardTicker(shards, config_num)
 					return
 				} 
@@ -508,10 +519,18 @@ func (kv *ShardKV) sendAddShard(gid int, shards []int, config_num int){
 	}
 }
 
+func (kv *ShardKV) PrintAllShardState(){
+	for i := 0; i < shardctrler.NShards; i++{
+		DPrintf("[group %v server %v]:PrintAllShardState shard %d state %d", kv.gid, kv.me, i, kv.shard_data[i].ShardState)
+	}
+}
+
 func (kv *ShardKV) AddShard(args *AddShardArgs, reply *AddShardReply){
+	DPrintf("[group %v server %v]:AddShard from group%v start\n", kv.gid, kv.me, args.RPCId.ClientId)
 	operations := Op{Type: "AddShard", Key: "", Value: "", RPCId: args.RPCId}
 	operations.NewShardData = args.ShardDataToAdd
 	op_result := kv.HandleConfigurationChange(operations)
+	DPrintf("[group %v server %v]:AddShard from group%v end, reply %v\n", kv.gid, kv.me, args.RPCId.ClientId, op_result.Err)
 	reply.Err = op_result.Err
 }
 
@@ -528,16 +547,14 @@ func (kv *ShardKV) ConfigurationReader(){
 		for i := 0; i < shardctrler.NShards; i++{
 			if kv.shard_data[i].ShardState == TRANSFERING_OUT {
 				finished = false
-				if g, ok := gid2need_send_shard[kv.cur_config.Shards[i]]; ok{
-					gid2need_send_shard[kv.cur_config.Shards[i]] = append(g, i)
-				} else {
-					gid2need_send_shard[kv.cur_config.Shards[i]] = []int{i}
-				}
+				gid2need_send_shard[kv.cur_config.Shards[i]] = append(gid2need_send_shard[kv.cur_config.Shards[i]], i)
 			}else if kv.shard_data[i].ShardState == TRANSFERING_IN{
+				DPrintf("[group %v server %v]ConfigurationReader: shard %d wait for transfering in\n", kv.gid, kv.me, i)
 				finished = false
 			} 
 		}
 		if !finished{
+			DPrintf("[group %v server %v]ConfigurationReader: unfinished transfering %v\n", kv.gid, kv.me, gid2need_send_shard)
 			kv.mu.Unlock()
 			for gid, shard_list := range gid2need_send_shard{
 				go kv.sendAddShard(gid, shard_list, kv.cur_config.Num)
@@ -555,6 +572,7 @@ func (kv *ShardKV) ConfigurationReader(){
 			time.Sleep(GetConfInterval)
 			continue
 		} else {
+			DPrintf("[group %v server %v]ConfigurationReader: cur config%v, new config %v\n", kv.gid, kv.me, kv.cur_config, new_config)
 			op := Op{Type: UPDATECONFIG, Key: "", Value: "", RPCId: UniqueId{int64(kv.gid), new_config.Num}, NewConfig: new_config}
 			kv.mu.Unlock()
 			kv.HandleConfigurationChange(op)
