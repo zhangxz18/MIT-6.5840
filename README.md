@@ -48,3 +48,19 @@
     这种情况下ApplyChReader先拿锁，此时RPC handler恰好timeout了，handler想要拿锁去关闭chan，但是需要等ApplyHandler释放锁；ApplyChReader尝试写channel，但是因为RPC handler已经不listen了，写操作被block了，于是就死锁了。
 + snapshot考虑如下时序:server 1的ApplyChReader已经执行了index为1、2、3的op，然后这时候来了一个snapshotindex为2的installSnapshot，如果server 1直接把kv换成新的snapshot对应的kv就会出bug（op3就被覆盖了），所以需要记录snapshot最后执行的日志index。
 + 在commit_ticker中如果遇到读到负下标的情况（即，读了已经被snapshot的内容），需要考虑snapshot后的lastIndex是否正确更新了。在我原先的实现中，我用一个bool变量installing_snapshot标记是否有snapshot未完成，如果installing_snapshot==true，commit_ticker就不能把数据写入applyMsg；在一个goroutine把snapshot写进applyCh以后，才会把installing_snapshot设成false。但这样实现是有问题的：如果有两个连续的installSnapshot，那么前一个写入后就会把applyCh设为false，即使此时第二个snapshot还没写入applyCh（即lastIdx没更新）。解决办法是把installing_snapshot改成int。（这其实应该是lab 2d的问题，但2d的测试没测出来，3B才测出来）
+
+# Lab 4A
++ 我的reblance方法是直接每次找到shard最多的group和shard最少的，然后移一个shard过去。这样的复杂度是O(group_num * shard_num)。有一个更快的方法是直接计算出每个group balance后应该有多少个shard，然后把多出来的部分丢进一个池子里，少的直接从这个池子里取，这是O(group_num + shard_num)。但反正都是很小的数字所以没那么写了。
+
+# Lab 4B
++ 我们把changeConf也视为一个（或者说多个）需要写入日志的operation。顺序是：
+    + A 在ConfigurationGeter(goroutine)中poll ctrl 发现Configuration change（每次只更新到当前conf的下一个）, 调用raft.start({OpType:updateconfiguration}) ->
+    + updateconfiguration commit 被ApplyChRead读出来，更新configura ->
+    + ConfigurationGeter 根据新的configuration，开始transmit或receive（例如需要transmit shard0到B，那就在ApplyChReader执行updateConfiguration的时候把shard0的状态改成transfering，然后ConfigurationGeter会开一个线程发RPC，RPC收到OK以后做一个operation removeShard；收到一个transmit RPC就add就可以） -> 
+    + 直到关于A的迁移全部完成，A才有可能继续更新到下一个configuration。
++ 实际上我们需要保证一个kvshard server上的迁移看上去是原子的。针对一个key a，我们记原来它在server A上，要被迁移到B上。
+    + 在A意识到要迁移前（或者说，commit changeConf以前）：a相关请求始终由A来处理
+    + 在A意识到要迁移后（开始迁移后，commit changeConf以后）：A拒绝请求
+    + 在B完成迁移前：拒绝请求
+    + 在B意识到要迁移且完成迁移RPC后：开始处理关于a的请求
++ 因为server是并发的，我们不能使用类似seqid判断是否重复请求。但是，因为我们有cur_config.num和sharddata.shard_state两种状态，我们可以直接通过这两个判断是否是重复请求。
