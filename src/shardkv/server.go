@@ -283,6 +283,8 @@ func (kv *ShardKV) ApplyChReader() {
 							}
 							// todo: garbage collection
 							kv.shard_data[shard_idx].ShardState = NOTOWNED
+							kv.shard_data[shard_idx].KVMap = make(map[string]string)
+							kv.shard_data[shard_idx].LastOpReuslt = make(map[int64]OpResult)
 						}
 						DPrintf("[group %v server %v]:ApplyChReader handle RemoveShard %v finished, result is %v\n", kv.gid, kv.me, chan_op.RemoveShardList, op_result.Err)
 					}
