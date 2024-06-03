@@ -18,6 +18,7 @@ import (
 const ApplyTimeOut = 500 * time.Millisecond
 const GetConfInterval = 90 * time.Millisecond // should be less than 100 ms
 const RPCRetryInterval = 100 * time.Millisecond
+const EmptyOpWrieInterval = 100 * time.Millisecond
 const INVALIDGID = 0
 type ShardState int
 const (
@@ -212,6 +213,7 @@ func (kv *ShardKV) ApplyChReader() {
 		kv.mu.Lock()
 		if m.CommandValid{
 			if m.CommandIndex <= kv.last_executed_index{
+				DPrintf("[group %v server %v]:ApplyChReader: command %v <= %v, has been executed\n", kv.gid, kv.me, m.CommandIndex, kv.last_executed_index)
 				kv.mu.Unlock()
 				continue
 			}
@@ -244,6 +246,7 @@ func (kv *ShardKV) ApplyChReader() {
 						// kv.lastOpReuslt[chan_op.RPCId.ClientId] = op_result
 					}
 				} else if chan_op.Type == ADDSHARD{
+					DPrintf("[group %v server %v]:ApplyChReader handle AddShard for idx%v\n", kv.gid, kv.me, m.CommandIndex)
 					if chan_op.RPCId.RequestId < int(kv.cur_config.Num){
 						op_result.Err = ErrConfigFinished
 					} else if chan_op.RPCId.RequestId > int(kv.cur_config.Num){
@@ -261,6 +264,7 @@ func (kv *ShardKV) ApplyChReader() {
 							}
 							CloneShardData(&chan_op.NewShardData[i], &kv.shard_data[shard_idx])
 							kv.shard_data[shard_idx].ShardState = OWNED
+							DPrintf("[group %v server %v]:ApplyChReader handle AddShard %v finished\n", kv.gid, kv.me, shard_idx)
 						}
 					}
 				} else if chan_op.Type == RemoveSHARD{
@@ -423,6 +427,7 @@ func (kv *ShardKV) KVReadPersist(data []byte) {
 		return
 	}
 	// // Your code here (2C).
+	DPrintf("[group %v server %v]:KVReadPersist\n", kv.gid, kv.me)
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var sd []ShardData
@@ -438,6 +443,7 @@ func (kv *ShardKV) KVReadPersist(data []byte) {
 		kv.prev_config = pc
 		kv.cur_config = cc
 	}
+	DPrintf("[group %v server %v]:KVReadPersist finished, last_executed_index: %v, prev_config:%v, now_config:%v\n", kv.gid, kv.me, kv.last_executed_index, kv.prev_config, kv.cur_config)
 }
 
 func (kv *ShardKV) HandleConfigurationChange(op Op) OpResult{
@@ -505,7 +511,10 @@ func (kv *ShardKV) sendAddShard(gid int, shards []int, config_num int){
 	DPrintf("[group %v server %v]:sendAddShard %v to group %v\n", kv.gid, kv.me, shards, gid)
 	// todo:如果接收方一直没收到这个shard，就永远卡在这了？好像也合理
 	for !kv.killed(){
-		if servers, ok := kv.cur_config.Groups[gid]; ok{
+		kv.mu.Lock()
+		servers, ok := kv.cur_config.Groups[gid]
+		kv.mu.Unlock()
+		if  ok{
 			for si := 0; si < len(servers); si++{
 				srv := kv.make_end(servers[si])
 				var reply AddShardReply
@@ -551,12 +560,12 @@ func (kv *ShardKV) ConfigurationReader(){
 				finished = false
 				gid2need_send_shard[kv.cur_config.Shards[i]] = append(gid2need_send_shard[kv.cur_config.Shards[i]], i)
 			}else if kv.shard_data[i].ShardState == TRANSFERING_IN{
-				DPrintf("[group %v server %v]ConfigurationReader: shard %d wait for transfering in\n", kv.gid, kv.me, i)
+				DPrintf("[group %v server %v]:ConfigurationReader: shard %d wait for transfering in\n", kv.gid, kv.me, i)
 				finished = false
 			} 
 		}
 		if !finished{
-			DPrintf("[group %v server %v]ConfigurationReader: unfinished transfering %v\n", kv.gid, kv.me, gid2need_send_shard)
+			DPrintf("[group %v server %v]:ConfigurationReader: unfinished transfering %v\n", kv.gid, kv.me, gid2need_send_shard)
 			kv.mu.Unlock()
 			for gid, shard_list := range gid2need_send_shard{
 				go kv.sendAddShard(gid, shard_list, kv.cur_config.Num)
@@ -574,7 +583,7 @@ func (kv *ShardKV) ConfigurationReader(){
 			time.Sleep(GetConfInterval)
 			continue
 		} else {
-			DPrintf("[group %v server %v]ConfigurationReader: cur config%v, new config %v\n", kv.gid, kv.me, kv.cur_config, new_config)
+			DPrintf("[group %v server %v]:ConfigurationReader: cur config%v, new config %v\n", kv.gid, kv.me, kv.cur_config, new_config)
 			op := Op{Type: UPDATECONFIG, Key: "", Value: "", RPCId: UniqueId{int64(kv.gid), new_config.Num}, NewConfig: new_config}
 			kv.mu.Unlock()
 			kv.HandleConfigurationChange(op)
@@ -582,6 +591,14 @@ func (kv *ShardKV) ConfigurationReader(){
 			continue
 		}
 	}
+}
+
+func (kv *ShardKV) EmptyOpWriter(){
+	// a goroutine write empty op periods, to avoid the deadlock due to no new op mentioned in the readme
+	for !kv.killed(){
+		kv.rf.Start(nil)
+		time.Sleep(EmptyOpWrieInterval)
+	} 
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -652,6 +669,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	
 	go kv.ApplyChReader()
 	go kv.ConfigurationReader()
+	go kv.EmptyOpWriter()
 
 	return kv
 }
