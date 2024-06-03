@@ -2,10 +2,21 @@
 课程网站：http://nil.csail.mit.edu/6.5840/2023/schedule.html  
 测试脚本来源：https://gist.github.com/JJGO/0d73540ef7cc2f066cb535156b7cbdab 
 ## Result
-### Lab 1
+通过了所有测试（每个测试至少运行500次, 下面只放出一部分）
++ Lab 1
 ![Lab1_test_result](picture/lab1_result.png)
-### Lab 2
++ Lab 2
 ![Lab2_test_result](picture/lab2_result.png)
++ Lab 3
+![Lab3_test_result](picture/lab3_result2.png)
++ Lab 4A
+![Lab4A_test_result](picture/lab4a_result.png)
++ Lab 4B
+![Lab4B_test_result](picture/lab4b_result.png)
+
+
+
+
 
 ## Notes
 ### Lab 1
@@ -26,7 +37,7 @@
     + 优化1：减少ticker的唤醒频率，即follower或candidate下一次唤醒时间不应该小于min(timeout_time, now_time + heartbeattimeout)，而不需要用20ms的固定interval。但是这个办法没能解决问题。（实际上有可能小于，例如vote后reset_election_timeout的随机数恰好很小，就可能小于，但影响不大）
     + 优化2：减少commit_ticker的唤醒频率，从固定周期唤醒改成sync.Cond来做。没能解决问题。
     + 优化3：放弃RPC call fail的重传，解决了。因为需要重传的信息迟早会以别的方式到达，因此正确性可以保证；但这似乎不符合文章中“Servers retry RPCs if they do not receive a response in a timely manner”的要求。
-    + **上面不本质。本质原因是我sendAppendEntries的时候直接写了for{}而不是for!killed{}。导致kill之后goroutine还一直存在，占用了大量memory和cpu**。
+    + **上面不本质。本质原因是我sendAppendEntries的时候直接写了for{}而不是for!killed{}。导致kill之后goroutine还一直存在，占用了大量memory和cpu。**
 ### Lab 3
 + linearizable和去重：使用一个goroutine（ApplyChReader）不断读ApplyCh，并且执行读出来的log，由于执行是单线程的，可以保证linearizable。Log重复没有关系，只要ApplyChReader读出来的时候检查一下是否重复，如果重复就不执行就可以。
 + 由于client是单线程的，所以如果server上client 1的request N已经被apply了，那么所有小于N的都已经被apply了（否则client就会处于重传小于N的request状态），因此如果这时候applyChReader从applyCh读出了一个小于N的operation，可以直接不管它。
@@ -63,4 +74,19 @@
     + 在A意识到要迁移后（开始迁移后，commit changeConf以后）：A拒绝请求
     + 在B完成迁移前：拒绝请求
     + 在B意识到要迁移且完成迁移RPC后：开始处理关于a的请求
-+ 因为server是并发的，我们不能使用类似seqid判断是否重复请求。但是，因为我们有cur_config.num和sharddata.shard_state两种状态，我们可以直接通过这两个判断是否是重复请求。
++ 一个服务器对一个shard i的状态转移图如下。只有在OWNED的情况下才能处理相应的请求。
+```mermaid
+stateDiagram-v2
+    [*] --> NOTOWNED
+    NOTOWNED --> TRANSFER_IN: Execute UpdateConfiguration && cur_config.Shards[i] == kv.gid && prev_config.Shards[i] != kv.gid && prev_config.Shards[i] != 0
+    NOTOWNED --> OWNED: Execute UpdateConfiguration && cur_config.Shards[i] == kv.gid && prev_config.Shards[i] != kv.gid && prev_config.Shards[i] == 0
+    OWNED --> TRANSFER_OUT: Execute UpdateConfiguration && cur_config.Shards[i] != kv.gid && prev_config.Shards[i] == kv.gid
+    TRANSFER_OUT --> NOTOWNED: Execute RemoveShard(After AddShard RPC successing)
+    TRANSFER_IN --> OWNED: Execute AddShard
+```
++ 因为server是并发的，我们不能使用类似seqid判断是否重复请求，除非用一个表记录每一个seqid的执行结果（但是这样很麻烦）。但是，因为我们有cur_config.num和sharddata.shard_state两种状态，我们可以直接通过这两个判断是否是重复请求（例如对于AddShard，如果cur_config.num大于RPC的config_num，或者config_num相等但是shard的状态已经是OWNED，那这个RPC就是staled的了）
++ 如果我们在start之前检查是否是当前shard（实际上不检查也有可能），就有可能发生如下死锁。
+    + group 102有server 1，2，3。处于config3，term 1的时候，整个group都挂掉了，挂掉的时候snapshot存的config2的状态（例如，shard 1 2 3被认为还没到）。那么重启之后应该有个{op:AddShard{1 2 3} term:1 idx:1}的log还没commit。重启以后，这个log在三台机器上，理论上应该被commit，但是此时group 102进入了term 2，如果没有新的term 2的log，他们就无法commit（因为不能commit以前term的log，需要有一个新的term的log），从而永远卡在config2；因为卡在config2，他们不会start任何请求（因为shard不对），于是永远无法commit这个log，（发生概率大约200次TestConcurrent3测试会发生5-10次）
+    + 解决办法1：删掉start前的检查，只在operate的时候检查，这样只要有新的请求过来就可以写进log，然后就可以commit了。这样看上去是可行的，但是有一个问题：如果新的config 3直接把group102给删掉了，client就不会给他发请求，没有新的log就没法commit；但是group101可能还在等着group 102 进入config 2以后把shard 1 2 3 给他发过去。就又死锁了。（这样修改后大约100次发生1次死锁）
+    + 解决办法2：heartbeat的时候写一个当前term的空log。这样可以解决上面的问题，但是会过不了lab2的测试（因为lab2会检查commit的log内容）
+    + 解决办法3：让server每隔一段时间start一个空操作。成功解决。但感觉这样不太优雅。本质原因是我的实现里是由给出shard的server主动发送RPC，如果改成由需要shard的server来发RPC就不会有这个问题（不过这样需要两轮RPC才能完成一次AddShard）。
