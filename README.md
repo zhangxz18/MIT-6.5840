@@ -60,10 +60,10 @@
 + snapshot考虑如下时序:server 1的ApplyChReader已经执行了index为1、2、3的op，然后这时候来了一个snapshotindex为2的installSnapshot，如果server 1直接把kv换成新的snapshot对应的kv就会出bug（op3就被覆盖了），所以需要记录snapshot最后执行的日志index。
 + 在commit_ticker中如果遇到读到负下标的情况（即，读了已经被snapshot的内容），需要考虑snapshot后的lastIndex是否正确更新了。在我原先的实现中，我用一个bool变量installing_snapshot标记是否有snapshot未完成，如果installing_snapshot==true，commit_ticker就不能把数据写入applyMsg；在一个goroutine把snapshot写进applyCh以后，才会把installing_snapshot设成false。但这样实现是有问题的：如果有两个连续的installSnapshot，那么前一个写入后就会把applyCh设为false，即使此时第二个snapshot还没写入applyCh（即lastIdx没更新）。解决办法是把installing_snapshot改成int。（这其实应该是lab 2d的问题，但2d的测试没测出来，3B才测出来）
 
-# Lab 4A
+### Lab 4A
 + 我的reblance方法是直接每次找到shard最多的group和shard最少的，然后移一个shard过去。这样的复杂度是O(group_num * shard_num)。有一个更快的方法是直接计算出每个group balance后应该有多少个shard，然后把多出来的部分丢进一个池子里，少的直接从这个池子里取，这是O(group_num + shard_num)。但反正都是很小的数字所以没那么写了。
 
-# Lab 4B
+### Lab 4B
 + 我们把changeConf也视为一个（或者说多个）需要写入日志的operation。顺序是：
     + A 在ConfigurationGeter(goroutine)中poll ctrl 发现Configuration change（每次只更新到当前conf的下一个）, 调用raft.start({OpType:updateconfiguration}) ->
     + updateconfiguration commit 被ApplyChRead读出来，更新configura ->
